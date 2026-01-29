@@ -1029,7 +1029,6 @@ const SidePanel = () => {
                   aria-label={t('nav_newChat_a11y')}
                   tabIndex={0}>
                   <PiPlusBold size={18} />
-                  23
                 </button>
                 <button
                   type="button"

@@ -14,9 +14,9 @@ const defaultFavoritePrompts = [
     content: 'Follow us at https://x.com/nanobrowser_ai to stay updated on the latest news and features!',
   },
   {
-    title: '🌟 下载艺术设计的ppt',
+    title: '🌟 下载三个不同主题的艺术设计的ppt',
     content:
-      "在https://www.1ppt.com/中搜索五个关于艺术设计的ppt并下载",
+      "在https://www.1ppt.com/中搜索三个不同的主题的关于艺术设计的ppt并下载",
   },
 ];
 

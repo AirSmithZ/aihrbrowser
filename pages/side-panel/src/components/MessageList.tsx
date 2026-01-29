@@ -108,7 +108,7 @@ function MessageBlock({ message, isSameActor, isDarkMode = false }: MessageBlock
             }`}>
             {isProgress ? (
               <div className="flex min-w-[5.5rem] flex-col gap-2">
-                <div className="flex items-center gap-1.5">
+                {/* <div className="flex items-center gap-1.5">
                   <span
                     className={`text-sm font-medium tracking-wide ${
                       isDarkMode ? 'text-slate-200' : 'text-gray-700'
@@ -126,7 +126,7 @@ function MessageBlock({ message, isSameActor, isDarkMode = false }: MessageBlock
                       />
                     ))}
                   </span>
-                </div>
+                </div> */}
                 <div
                   className={`h-0.5 w-full overflow-hidden rounded-full ${
                     isDarkMode ? 'bg-slate-600/80' : 'bg-sky-100'
