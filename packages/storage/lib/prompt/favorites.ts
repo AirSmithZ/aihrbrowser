@@ -14,9 +14,9 @@ const defaultFavoritePrompts = [
     content: 'Follow us at https://x.com/nanobrowser_ai to stay updated on the latest news and features!',
   },
   {
-    title: '🌟 Star us on GitHub!',
+    title: '🌟 下载艺术设计的ppt',
     content:
-      "Open the Nanobrowser repository at https://github.com/nanobrowser/nanobrowser and check if you've already starred it. If not, please support us by giving us a star!",
+      "在https://www.1ppt.com/中搜索五个关于艺术设计的ppt并下载",
   },
 ];
 

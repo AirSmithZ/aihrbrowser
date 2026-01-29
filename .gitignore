@@ -25,7 +25,8 @@
 chrome-extension/public/manifest.json
 **/tailwind-output.css
 
-.nanobrowser
+
 .vscode
 .cursor
 *.py
+chrome-extension/public/aihr.config.local.json

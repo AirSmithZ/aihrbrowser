@@ -127,8 +127,72 @@ export function extractJsonFromModelOutput(content: string): Record<string, unkn
       }
     }
 
-    // Parse the cleaned content
-    return JSON.parse(processedContent);
+    // First, try to parse the cleaned content directly
+    try {
+      return JSON.parse(processedContent);
+    } catch {
+      // If direct parsing fails (e.g. model returns natural language + JSON),
+      // try to heuristically extract the first JSON object block.
+      const firstBrace = processedContent.indexOf('{');
+      const lastBrace = processedContent.lastIndexOf('}');
+
+      if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+        const jsonCandidate = processedContent.slice(firstBrace, lastBrace + 1);
+        try {
+          return JSON.parse(jsonCandidate);
+        } catch (parseError) {
+          // If the extracted block still fails, try to find nested JSON blocks
+          // by counting braces to find the matching closing brace
+          let braceCount = 0;
+          let endIndex = firstBrace;
+          for (let i = firstBrace; i < processedContent.length; i++) {
+            if (processedContent[i] === '{') braceCount++;
+            if (processedContent[i] === '}') braceCount--;
+            if (braceCount === 0) {
+              endIndex = i;
+              break;
+            }
+          }
+          if (endIndex > firstBrace) {
+            const nestedJsonCandidate = processedContent.slice(firstBrace, endIndex + 1);
+            return JSON.parse(nestedJsonCandidate);
+          }
+          throw parseError;
+        }
+      }
+
+      // As a secondary fallback, attempt to extract an array JSON block
+      const firstBracket = processedContent.indexOf('[');
+      const lastBracket = processedContent.lastIndexOf(']');
+      if (firstBracket !== -1 && lastBracket !== -1 && lastBracket > firstBracket) {
+        const jsonArrayCandidate = processedContent.slice(firstBracket, lastBracket + 1);
+        try {
+          return JSON.parse(jsonArrayCandidate);
+        } catch {
+          // Try nested bracket matching similar to braces
+          let bracketCount = 0;
+          let endIndex = firstBracket;
+          for (let i = firstBracket; i < processedContent.length; i++) {
+            if (processedContent[i] === '[') bracketCount++;
+            if (processedContent[i] === ']') bracketCount--;
+            if (bracketCount === 0) {
+              endIndex = i;
+              break;
+            }
+          }
+          if (endIndex > firstBracket) {
+            const nestedArrayCandidate = processedContent.slice(firstBracket, endIndex + 1);
+            return JSON.parse(nestedArrayCandidate);
+          }
+        }
+      }
+    }
+
+    // If all attempts fail, throw a structured parse error with content preview for debugging
+    const contentPreview = content.length > 200 ? content.slice(0, 200) + '...' : content;
+    throw new ResponseParseError(
+      `Could not manually extract JSON from model output. Content preview: ${contentPreview}`,
+    );
   } catch (e) {
     throw new ResponseParseError(`Could not manually extract JSON from model output`);
   }

@@ -149,6 +149,23 @@ code {
   }
 }
 
+/* Smooth loading/progress animation for "Showing progress..." bubbles */
+@keyframes message-progress {
+  0% {
+    transform: translateX(-100%);
+  }
+  50% {
+    transform: translateX(0%);
+  }
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+.animate-progress {
+  animation: message-progress 1.2s ease-in-out infinite;
+}
+
 /* Dark mode text and background colors */
 @media (prefers-color-scheme: dark) {
   .dark-mode-text {

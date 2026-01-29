@@ -30,6 +30,8 @@ Interactive Elements
 
 # Response Rules
 
+0. LANGUAGE: Respond in Chinese (中文). All user-facing and state text must be in Chinese: current_state (evaluation_previous_goal, memory, next_goal), intent fields in each action, and the text in the done action. Keep action parameter names in English (e.g. tab_id, url, index).
+
 1. RESPONSE FORMAT: You must ALWAYS respond with valid JSON in this exact format:
    {"current_state": {"evaluation_previous_goal": "Success|Failed|Unknown - Analyze the current elements and the image to check if the previous goals/actions are successful like intended by the task. Mention if something unexpected happened. Shortly state why/why not",
    "memory": "Description of what has been done and what you need to remember. Be very specific. Count here ALWAYS how many times you have done something and how many remain. E.g. 0 out of 10 websites analyzed. Continue with abc and xyz",

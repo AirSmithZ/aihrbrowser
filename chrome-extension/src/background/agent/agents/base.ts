@@ -7,9 +7,29 @@ import { createLogger } from '@src/background/log';
 import type { Action } from '../actions/builder';
 import { convertInputMessages, extractJsonFromModelOutput, removeThinkTags } from '../messages/utils';
 import { isAbortedError, ResponseParseError } from './errors';
+import { repairJsonString } from '@src/background/utils';
 import { ProviderTypeEnum } from '@extension/storage';
 
 const logger = createLogger('agent');
+
+/**
+ * Normalize action args: some providers return switch_tab/close_tab with "id" instead of "tab_id".
+ * Mutates the action array in place so validation (Zod schema expecting tab_id) succeeds.
+ */
+function normalizeTabIdInActions(parsedArgs: { action?: unknown[] }): void {
+  if (!parsedArgs?.action || !Array.isArray(parsedArgs.action)) return;
+  for (const item of parsedArgs.action) {
+    if (!item || typeof item !== 'object') continue;
+    const obj = item as Record<string, unknown>;
+    for (const key of ['switch_tab', 'close_tab']) {
+      const payload = obj[key];
+      if (payload && typeof payload === 'object' && 'id' in payload && !('tab_id' in payload)) {
+        const p = payload as Record<string, unknown>;
+        p.tab_id = p.id;
+      }
+    }
+  }
+}
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type CallOptions = Record<string, any>;
@@ -115,6 +135,18 @@ export abstract class BaseAgent<T extends z.ZodType, M = unknown> {
       return false;
     }
 
+    // Claude 系列模型通过部分网关返回的 structured output / json_schema 支持并不稳定，
+    // 更可靠的方式是依赖我们自定义的 ChatClaudeToolProxy + 手动 JSON 抽取逻辑。
+    // 因此如果模型名里包含 claude/sonnet-4-5/haiku-4-5，则关闭 structured output。
+    const lowerName = this.modelName.toLowerCase();
+    if (lowerName.includes('claude') || lowerName.includes('sonnet-4-5') || lowerName.includes('haiku-4-5')) {
+      logger.debug(
+        `[${this.modelName}] Detected Claude-style model, disabling structured output and using manual JSON extraction`,
+      );
+      return false;
+    }
+
+    // 其它模型保持 structured output 打开
     return true;
   }
 
@@ -159,16 +191,83 @@ export abstract class BaseAgent<T extends z.ZodType, M = unknown> {
 
         // Try to extract JSON from raw response manually if possible
         const errorMessage = error instanceof Error ? error.message : String(error);
-        if (
-          errorMessage.includes('is not valid JSON') &&
-          response?.raw?.content &&
-          typeof response.raw.content === 'string'
-        ) {
-          const parsed = this.manuallyParseResponse(response.raw.content);
-          if (parsed) {
-            return parsed;
+        
+        // Check if we have raw response content to parse
+        if (response?.raw) {
+          // First try to parse from content string
+          if (response.raw.content && typeof response.raw.content === 'string') {
+            const parsed = this.manuallyParseResponse(response.raw.content);
+            if (parsed) {
+              logger.debug(`[${this.modelName}] Successfully parsed JSON from raw content after structured output failure`);
+              return parsed;
+            }
+          }
+          
+          // Also check for tool_calls in raw response (for Claude-style providers)
+          const rawMessage = response.raw as any;
+          if (rawMessage.tool_calls && Array.isArray(rawMessage.tool_calls) && rawMessage.tool_calls.length > 0) {
+            const firstToolCall = rawMessage.tool_calls[0];
+            
+            // Handle different tool_call structures
+            let parsedArgs: any = null;
+            
+            // Structure 1: LangChain processed format { name: string, args: object }
+            if (firstToolCall?.args && typeof firstToolCall.args === 'object' && !Array.isArray(firstToolCall.args)) {
+              parsedArgs = firstToolCall.args;
+            }
+            // Structure 2: OpenAI format { function: { name: string, arguments: string } }
+            else if (firstToolCall?.function?.arguments && typeof firstToolCall.function.arguments === 'string') {
+              try {
+                parsedArgs = JSON.parse(firstToolCall.function.arguments);
+              } catch (parseError) {
+                logger.warning(`[${this.modelName}] Failed to parse function.arguments:`, parseError);
+              }
+            }
+            
+            if (parsedArgs && typeof parsedArgs === 'object') {
+              // Fix: Handle double-escaped JSON strings (with repair + fallback for current_state)
+              if (parsedArgs.current_state && typeof parsedArgs.current_state === 'string') {
+                const raw = parsedArgs.current_state;
+                try {
+                  parsedArgs.current_state = JSON.parse(raw);
+                } catch {
+                  try {
+                    parsedArgs.current_state = JSON.parse(repairJsonString(raw));
+                  } catch {
+                    parsedArgs.current_state = {
+                      evaluation_previous_goal: '',
+                      memory: raw.slice(0, 2000),
+                      next_goal: '',
+                    };
+                  }
+                }
+              }
+              if (parsedArgs.action && typeof parsedArgs.action === 'string') {
+                const rawAction = parsedArgs.action;
+                try {
+                  parsedArgs.action = JSON.parse(rawAction);
+                } catch {
+                  try {
+                    parsedArgs.action = JSON.parse(repairJsonString(rawAction));
+                  } catch {
+                    // keep as-is; validation may fail
+                  }
+                }
+              }
+              
+              try {
+                const validated = this.validateModelOutput(parsedArgs);
+                if (validated) {
+                  logger.debug(`[${this.modelName}] Successfully parsed JSON from tool_calls arguments after structured output failure`);
+                  return validated;
+                }
+              } catch (parseError) {
+                logger.warning(`[${this.modelName}] Failed to validate tool_calls arguments:`, parseError);
+              }
+            }
           }
         }
+        
         logger.error(`[${this.modelName}] LLM call failed with error: \n${errorMessage}`);
         throw new Error(`Failed to invoke ${this.modelName} with structured output: \n${errorMessage}`);
       }
@@ -184,10 +283,151 @@ export abstract class BaseAgent<T extends z.ZodType, M = unknown> {
         ...this.callOptions,
       });
 
+      // Debug: Log response structure
+      logger.debug(`[${this.modelName}] Response type: ${response.constructor.name}`);
+      logger.debug(`[${this.modelName}] Response has tool_calls: ${!!(response as any).tool_calls}`);
+      logger.debug(`[${this.modelName}] Response content type: ${typeof response.content}`);
+      logger.debug(`[${this.modelName}] Response content preview: ${typeof response.content === 'string' ? response.content.slice(0, 200) : 'not a string'}`);
+
+      // First, check if response has tool_calls (for Claude-style providers via OpenAI-compatible gateways)
+      // LangChain's AIMessage may have tool_calls even if ChatClaudeToolProxy tried to transform it
+      const responseAny = response as any;
+      
+      // Check multiple possible locations for tool_calls
+      let toolCalls = responseAny.tool_calls;
+      if (!toolCalls && responseAny.additional_kwargs?.tool_calls) {
+        toolCalls = responseAny.additional_kwargs.tool_calls;
+      }
+
+      if (toolCalls && Array.isArray(toolCalls) && toolCalls.length > 0) {
+        logger.debug(`[${this.modelName}] Found ${toolCalls.length} tool_calls in response`);
+        const firstToolCall = toolCalls[0];
+        logger.debug(`[${this.modelName}] First tool_call structure:`, JSON.stringify(firstToolCall, null, 2));
+        
+        // Handle different tool_call structures
+        let parsedArgs: any = null;
+        
+        // Structure 1: LangChain processed format { name: string, args: object, type: string, id: string }
+        if (firstToolCall?.args && typeof firstToolCall.args === 'object' && !Array.isArray(firstToolCall.args)) {
+          logger.debug(`[${this.modelName}] Found LangChain processed tool_call.args (object)`);
+          parsedArgs = firstToolCall.args;
+        }
+        // Structure 2: OpenAI format { function: { name: string, arguments: string } }
+        else if (firstToolCall?.function?.arguments && typeof firstToolCall.function.arguments === 'string') {
+          logger.debug(`[${this.modelName}] Found OpenAI format tool_call.function.arguments (string)`);
+          try {
+            parsedArgs = JSON.parse(firstToolCall.function.arguments);
+          } catch (parseError) {
+            logger.warning(`[${this.modelName}] Failed to parse function.arguments:`, parseError);
+          }
+        }
+        // Structure 3: { args: string } (string format)
+        else if (firstToolCall?.args && typeof firstToolCall.args === 'string') {
+          logger.debug(`[${this.modelName}] Found tool_call.args (string)`);
+          try {
+            parsedArgs = JSON.parse(firstToolCall.args);
+          } catch (parseError) {
+            logger.warning(`[${this.modelName}] Failed to parse args string:`, parseError);
+          }
+        }
+        // Structure 4: Direct arguments field (string)
+        else if (firstToolCall?.arguments && typeof firstToolCall.arguments === 'string') {
+          logger.debug(`[${this.modelName}] Found tool_call.arguments (string)`);
+          try {
+            parsedArgs = JSON.parse(firstToolCall.arguments);
+          } catch (parseError) {
+            logger.warning(`[${this.modelName}] Failed to parse arguments string:`, parseError);
+          }
+        }
+
+        if (parsedArgs && typeof parsedArgs === 'object') {
+          try {
+            // Fix: Handle double-escaped JSON strings in current_state field (for Navigator)
+            // Some providers return current_state as a JSON string instead of an object
+            if (parsedArgs.current_state && typeof parsedArgs.current_state === 'string') {
+              const rawCurrentState = parsedArgs.current_state;
+              try {
+                logger.debug(`[${this.modelName}] current_state is a string, parsing it as JSON`);
+                parsedArgs.current_state = JSON.parse(rawCurrentState);
+                logger.debug(`[${this.modelName}] Successfully parsed current_state from string to object`);
+              } catch (parseError) {
+                try {
+                  const repaired = repairJsonString(rawCurrentState);
+                  parsedArgs.current_state = JSON.parse(repaired);
+                  logger.debug(`[${this.modelName}] Parsed current_state after repairJsonString`);
+                } catch (repairError) {
+                  logger.warning(`[${this.modelName}] Failed to parse current_state string (parse + repair):`, parseError);
+                  // Fallback: satisfy agentBrainSchema so validation passes and agent can continue
+                  parsedArgs.current_state = {
+                    evaluation_previous_goal: '',
+                    memory: rawCurrentState.slice(0, 2000),
+                    next_goal: '',
+                  };
+                  logger.debug(`[${this.modelName}] Using fallback current_state object`);
+                }
+              }
+            }
+
+            // Fix: Handle action field that might be a JSON string instead of an array
+            if (parsedArgs.action && typeof parsedArgs.action === 'string') {
+              const rawAction = parsedArgs.action;
+              try {
+                logger.debug(`[${this.modelName}] action is a string, parsing it as JSON`);
+                parsedArgs.action = JSON.parse(rawAction);
+                logger.debug(`[${this.modelName}] Successfully parsed action from string to array`);
+              } catch (parseError) {
+                try {
+                  parsedArgs.action = JSON.parse(repairJsonString(rawAction));
+                  logger.debug(`[${this.modelName}] Parsed action after repairJsonString`);
+                } catch (repairError) {
+                  logger.warning(`[${this.modelName}] Failed to parse action string (parse + repair):`, parseError);
+                  // Keep the string as is, validation will catch the error
+                }
+              }
+            }
+
+            // Fix: Some providers return switch_tab/close_tab with "id" instead of "tab_id"
+            normalizeTabIdInActions(parsedArgs);
+
+            logger.debug(`[${this.modelName}] Validating parsed tool_call arguments`);
+            const validated = this.validateModelOutput(parsedArgs);
+            if (validated) {
+              logger.debug(`[${this.modelName}] Successfully parsed and validated JSON from tool_calls`);
+              return validated;
+            }
+          } catch (validationError) {
+            logger.warning(`[${this.modelName}] Failed to validate tool_calls arguments:`, validationError);
+            logger.warning(`[${this.modelName}] Parsed args that failed validation:`, JSON.stringify(parsedArgs, null, 2));
+            // Fall through to try content parsing
+          }
+        } else {
+          logger.warning(`[${this.modelName}] tool_calls found but could not extract valid arguments. Tool call structure:`, JSON.stringify(firstToolCall, null, 2));
+        }
+      } else {
+        logger.debug(`[${this.modelName}] No tool_calls found in response`);
+      }
+
+      // Second, try to parse from content string
       if (typeof response.content === 'string') {
         const parsed = this.manuallyParseResponse(response.content);
         if (parsed) {
+          logger.debug(`[${this.modelName}] Successfully parsed JSON from response.content`);
           return parsed;
+        }
+      }
+
+      // If content is an array (multi-modal), try to extract text content
+      if (Array.isArray(response.content)) {
+        const textContent = response.content
+          .filter((item: any) => item.type === 'text')
+          .map((item: any) => item.text)
+          .join('\n');
+        if (textContent) {
+          const parsed = this.manuallyParseResponse(textContent);
+          if (parsed) {
+            logger.debug(`[${this.modelName}] Successfully parsed JSON from multi-modal content`);
+            return parsed;
+          }
         }
       }
     } catch (error) {
@@ -216,11 +456,15 @@ export abstract class BaseAgent<T extends z.ZodType, M = unknown> {
   // Helper method to manually parse the response content
   protected manuallyParseResponse(content: string): this['ModelOutput'] | undefined {
     const cleanedContent = removeThinkTags(content);
+    logger.debug(`[${this.modelName}] manuallyParseResponse - content length: ${cleanedContent.length}, preview: ${cleanedContent.slice(0, 200)}`);
     try {
       const extractedJson = extractJsonFromModelOutput(cleanedContent);
+      logger.debug(`[${this.modelName}] Successfully extracted JSON from content`);
+      normalizeTabIdInActions(extractedJson as { action?: unknown[] });
       return this.validateModelOutput(extractedJson);
     } catch (error) {
-      logger.warning('manuallyParseResponse failed', error);
+      logger.warning(`[${this.modelName}] manuallyParseResponse failed:`, error);
+      logger.warning(`[${this.modelName}] Content that failed to parse:`, cleanedContent.slice(0, 500));
       return undefined;
     }
   }

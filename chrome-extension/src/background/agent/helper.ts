@@ -59,6 +59,110 @@ class ChatLlama extends ChatOpenAI {
   }
 }
 
+// Custom Chat model for Claude-style models served via OpenAI-compatible gateways (e.g. api520)
+// These providers often return tool_calls with an AgentOutput function whose arguments contain
+// the actual JSON we need. This wrapper flattens that into a plain JSON string in message.content
+// so that downstream agents can use the existing manual JSON extraction pipeline reliably.
+class ChatClaudeToolProxy extends ChatOpenAI {
+  constructor(args: any) {
+    super(args);
+  }
+
+  // Override the completionWithRetry method to intercept and transform the response
+  async completionWithRetry(request: any, options?: any): Promise<any> {
+    try {
+      const response = await super.completionWithRetry(request, options);
+
+      console.log('[ChatClaudeToolProxy] Raw response received, checking for tool_calls...');
+      console.log('[ChatClaudeToolProxy] Response structure:', {
+        hasChoices: !!response?.choices,
+        choicesLength: response?.choices?.length,
+        finishReason: response?.choices?.[0]?.finish_reason,
+      });
+
+      try {
+        const firstChoice = response?.choices?.[0];
+        const message = firstChoice?.message;
+        
+        console.log('[ChatClaudeToolProxy] Message structure:', {
+          hasMessage: !!message,
+          hasToolCalls: !!message?.tool_calls,
+          toolCallsLength: message?.tool_calls?.length,
+          contentPreview: typeof message?.content === 'string' ? message.content.slice(0, 100) : 'not a string',
+        });
+
+        // OpenAI-compatible tool call format: message.tool_calls[0].function.arguments
+        const rawToolCalls = message?.tool_calls;
+
+        if (rawToolCalls && Array.isArray(rawToolCalls) && rawToolCalls.length > 0) {
+          console.log('[ChatClaudeToolProxy] Found tool_calls, processing...');
+          const firstToolCall = rawToolCalls[0];
+          const fn = firstToolCall?.function;
+          const argsRaw = fn?.arguments;
+
+          console.log('[ChatClaudeToolProxy] Tool call structure:', {
+            hasFunction: !!fn,
+            hasArguments: !!argsRaw,
+            argumentsType: typeof argsRaw,
+            argumentsLength: typeof argsRaw === 'string' ? argsRaw.length : 0,
+            argumentsPreview: typeof argsRaw === 'string' ? argsRaw.slice(0, 200) : 'not a string',
+          });
+
+          if (typeof argsRaw === 'string') {
+            // Parse the JSON string inside arguments to validate it
+            let parsedArgs;
+            try {
+              parsedArgs = JSON.parse(argsRaw);
+              console.log('[ChatClaudeToolProxy] Successfully parsed arguments JSON');
+            } catch (parseError) {
+              console.warn('[ChatClaudeToolProxy] Failed to parse tool_calls arguments as JSON:', parseError);
+              console.warn('[ChatClaudeToolProxy] Arguments that failed:', argsRaw.slice(0, 500));
+              return response; // Return original if JSON parsing fails
+            }
+
+            // Transform the response: replace tool_calls with plain JSON content
+            // IMPORTANT: We need to completely remove tool_calls, not just set to undefined
+            const transformedMessage: any = {
+              role: 'assistant',
+              // Put the parsed JSON back as a string so downstream can parse it
+              content: JSON.stringify(parsedArgs),
+            };
+            // Explicitly do NOT include tool_calls field
+
+            const transformed = {
+              ...response,
+              choices: [
+                {
+                  ...firstChoice,
+                  message: transformedMessage,
+                  // Change finish_reason from 'tool_calls' to 'stop'
+                  finish_reason: 'stop',
+                },
+              ],
+            };
+
+            console.log('[ChatClaudeToolProxy] Successfully transformed tool_calls to JSON content');
+            console.log('[ChatClaudeToolProxy] Transformed message content preview:', transformedMessage.content.slice(0, 200));
+            return transformed;
+          } else {
+            console.warn('[ChatClaudeToolProxy] tool_calls found but arguments is not a string:', typeof argsRaw);
+          }
+        } else {
+          console.log('[ChatClaudeToolProxy] No tool_calls found in response, returning original');
+        }
+      } catch (innerError) {
+        console.error('[ChatClaudeToolProxy] Failed to transform tool_calls response, falling back to original:', innerError);
+        // Fall through to return the original response
+      }
+
+      return response;
+    } catch (error: any) {
+      console.error('[ChatClaudeToolProxy] Error during API call:', error);
+      throw error;
+    }
+  }
+}
+
 // O series models or GPT-5 models that support reasoning
 function isOpenAIReasoningModel(modelName: string): boolean {
   let modelNameWithoutProvider = modelName;
@@ -149,6 +253,33 @@ function createOpenAIChatModel(
     args.temperature = (modelConfig.parameters?.temperature ?? 0.1) as number;
     args.maxTokens = maxTokens;
   }
+
+  // Heuristic: for Claude-style models served via custom OpenAI-compatible gateways,
+  // use ChatClaudeToolProxy so that tool_calls.AgentOutput arguments are flattened into content.
+  const lowerModelName = modelConfig.modelName.toLowerCase();
+  const isClaudeLikeModel =
+    lowerModelName.includes('claude') ||
+    lowerModelName.includes('sonnet-4-5') ||
+    lowerModelName.includes('haiku-4-5');
+  const isCustomGateway =
+    typeof providerConfig.baseUrl === 'string' &&
+    (providerConfig.baseUrl.includes('api520.pro') || providerConfig.baseUrl.includes('claude') || providerConfig.baseUrl.includes('anthropic'));
+
+  console.log('[createOpenAIChatModel] Model selection:', {
+    modelName: modelConfig.modelName,
+    lowerModelName,
+    isClaudeLikeModel,
+    baseUrl: providerConfig.baseUrl,
+    isCustomGateway,
+    willUseProxy: isClaudeLikeModel || isCustomGateway,
+  });
+
+  if (isClaudeLikeModel || isCustomGateway) {
+    console.log('[createOpenAIChatModel] Using ChatClaudeToolProxy for model:', modelConfig.modelName);
+    return new ChatClaudeToolProxy(args);
+  }
+
+  console.log('[createOpenAIChatModel] Using standard ChatOpenAI for model:', modelConfig.modelName);
   return new ChatOpenAI(args);
 }
 
@@ -351,8 +482,8 @@ export function createChatModel(providerConfig: ProviderConfig, modelConfig: Mod
       console.log('[createChatModel] Calling createOpenAIChatModel for OpenRouter');
       return createOpenAIChatModel(providerConfig, modelConfig, {
         headers: {
-          'HTTP-Referer': 'https://nanobrowser.ai',
-          'X-Title': 'Nanobrowser',
+          'HTTP-Referer': 'https://aihr.ai',
+          'X-Title': 'AIHR',
         },
       });
     }

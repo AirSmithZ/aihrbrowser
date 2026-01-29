@@ -1,6 +1,6 @@
 import type { Message } from '@extension/storage';
 import { ACTOR_PROFILES } from '../types/message';
-import { memo } from 'react';
+import { memo, useEffect, useState } from 'react';
 
 interface MessageListProps {
   messages: Message[];
@@ -29,12 +29,46 @@ interface MessageBlockProps {
 }
 
 function MessageBlock({ message, isSameActor, isDarkMode = false }: MessageBlockProps) {
-  if (!message.actor) {
-    console.error('No actor found');
-    return <div />;
-  }
-  const actor = ACTOR_PROFILES[message.actor as keyof typeof ACTOR_PROFILES];
+  // Hooks must be called unconditionally at the top of the component
+  const [displayContent, setDisplayContent] = useState(message.content);
+  const actorKey = (message.actor || 'system') as keyof typeof ACTOR_PROFILES;
+  const actor = ACTOR_PROFILES[actorKey];
   const isProgress = message.content === 'Showing progress...';
+
+  useEffect(() => {
+    if (!message.actor) {
+      // For unexpected missing actor, just keep whatever content we already have
+      return;
+    }
+
+    if (isProgress || message.actor === 'user') {
+      setDisplayContent(message.content);
+      return;
+    }
+
+    const text = message.content;
+    // Short messages render instantly
+    if (text.length <= 8) {
+      setDisplayContent(text);
+      return;
+    }
+
+    let index = 0;
+    setDisplayContent('');
+
+    const step = Math.max(1, Math.floor(text.length / 80)); // roughly 60–80 frames
+    const interval = window.setInterval(() => {
+      index += step;
+      if (index >= text.length) {
+        setDisplayContent(text);
+        window.clearInterval(interval);
+      } else {
+        setDisplayContent(text.slice(0, index));
+      }
+    }, 16); // ~60fps
+
+    return () => window.clearInterval(interval);
+  }, [isProgress, message.actor, message.content]);
 
   return (
     <div
@@ -45,9 +79,11 @@ function MessageBlock({ message, isSameActor, isDarkMode = false }: MessageBlock
       }`}>
       {!isSameActor && (
         <div
-          className="flex size-8 shrink-0 items-center justify-center rounded-full"
+          className="flex size-9 shrink-0 items-center justify-center rounded-full shadow-sm"
           style={{ backgroundColor: actor.iconBackground }}>
-          <img src={actor.icon} alt={actor.name} className="size-6" />
+          <span className="text-lg" aria-hidden="true">
+            {'emoji' in actor ? (actor as { emoji: string }).emoji : '💬'}
+          </span>
         </div>
       )}
       {isSameActor && <div className="w-8" />}
@@ -59,14 +95,53 @@ function MessageBlock({ message, isSameActor, isDarkMode = false }: MessageBlock
           </div>
         )}
 
-        <div className="space-y-0.5">
-          <div className={`whitespace-pre-wrap break-words text-sm ${isDarkMode ? 'text-gray-300' : 'text-gray-700'}`}>
+        <div className="space-y-1">
+          <div
+            className={`inline-block max-w-full whitespace-pre-wrap break-words rounded-2xl px-3 py-2 text-sm shadow-sm ${
+              isProgress
+                ? isDarkMode
+                  ? 'bg-slate-800'
+                  : 'bg-gray-100'
+                : isDarkMode
+                  ? 'bg-slate-800 text-gray-100'
+                  : 'bg-white text-gray-800'
+            }`}>
             {isProgress ? (
-              <div className={`h-1 overflow-hidden rounded ${isDarkMode ? 'bg-gray-700' : 'bg-gray-200'}`}>
-                <div className="h-full animate-progress bg-blue-500" />
+              <div className="flex min-w-[5.5rem] flex-col gap-2">
+                <div className="flex items-center gap-1.5">
+                  <span
+                    className={`text-sm font-medium tracking-wide ${
+                      isDarkMode ? 'text-slate-200' : 'text-gray-700'
+                    }`}>
+                    思考中
+                  </span>
+                  <span className="flex gap-0.5" aria-hidden="true">
+                    {[0, 1, 2].map((i) => (
+                      <span
+                        key={i}
+                        className={`h-1.5 w-1.5 shrink-0 rounded-full ${
+                          isDarkMode ? 'bg-sky-400' : 'bg-sky-500'
+                        } animate-thinkDot`}
+                        style={{ animationDelay: `${i * 0.16}s` }}
+                      />
+                    ))}
+                  </span>
+                </div>
+                <div
+                  className={`h-0.5 w-full overflow-hidden rounded-full ${
+                    isDarkMode ? 'bg-slate-600/80' : 'bg-sky-100'
+                  }`}>
+                  <div
+                    className={`h-full w-1/2 rounded-full ${
+                      isDarkMode
+                        ? 'bg-gradient-to-r from-transparent via-sky-400 to-transparent'
+                        : 'bg-gradient-to-r from-transparent via-sky-500 to-transparent'
+                    } animate-thinkBar`}
+                  />
+                </div>
               </div>
             ) : (
-              message.content
+              displayContent
             )}
           </div>
           {!isProgress && (

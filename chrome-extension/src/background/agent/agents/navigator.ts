@@ -23,7 +23,7 @@ import {
   RequestCancelledError,
 } from './errors';
 import { calcBranchPathHashSet } from '@src/background/browser/dom/views';
-import { type BrowserState, BrowserStateHistory, URLNotAllowedError } from '@src/background/browser/views';
+import { type BrowserState, BrowserStateHistory } from '@src/background/browser/views';
 import { convertZodToJsonSchema, repairJsonString } from '@src/background/utils';
 import { HistoryTreeProcessor } from '@src/background/browser/dom/history/service';
 import { AgentStepRecord } from '../history';
@@ -113,40 +113,197 @@ export class NavigatorAgent extends BaseAgent<z.ZodType, NavigatorResult> {
           throw error;
         }
 
-        // Try to extract JSON from markdown code blocks if parsing failed
+        // Try to extract JSON from raw response manually if possible
         const errorMessage = error instanceof Error ? error.message : String(error);
-        if (
-          errorMessage.includes('is not valid JSON') &&
-          response?.raw?.content &&
-          typeof response.raw.content === 'string'
-        ) {
-          const parsed = this.manuallyParseResponse(response.raw.content);
-          if (parsed) {
-            return parsed;
+        
+        if (response?.raw) {
+          // First try to parse from content string
+          if (response.raw.content && typeof response.raw.content === 'string') {
+            const parsed = this.manuallyParseResponse(response.raw.content);
+            if (parsed) {
+              logger.debug(`[${this.modelName}] Successfully parsed JSON from raw content after structured output failure`);
+              return parsed;
+            }
+          }
+          
+          // Also check for tool_calls in raw response (for Claude-style providers)
+          const rawMessage = response.raw as any;
+          if (rawMessage.tool_calls && Array.isArray(rawMessage.tool_calls) && rawMessage.tool_calls.length > 0) {
+            const firstToolCall = rawMessage.tool_calls[0];
+            
+            // Handle different tool_call structures
+            let parsedArgs: any = null;
+            
+            // Structure 1: LangChain processed format { name: string, args: object }
+            if (firstToolCall?.args && typeof firstToolCall.args === 'object' && !Array.isArray(firstToolCall.args)) {
+              parsedArgs = firstToolCall.args;
+            }
+            // Structure 2: OpenAI format { function: { name: string, arguments: string } }
+            else if (firstToolCall?.function?.arguments && typeof firstToolCall.function.arguments === 'string') {
+              try {
+                parsedArgs = JSON.parse(firstToolCall.function.arguments);
+              } catch (parseError) {
+                logger.warning(`[${this.modelName}] Failed to parse function.arguments:`, parseError);
+              }
+            }
+            
+            if (parsedArgs && typeof parsedArgs === 'object') {
+              // Fix: Handle double-escaped JSON strings (with repair + fallback for current_state)
+              if (parsedArgs.current_state && typeof parsedArgs.current_state === 'string') {
+                const raw = parsedArgs.current_state;
+                try {
+                  parsedArgs.current_state = JSON.parse(raw);
+                } catch {
+                  try {
+                    parsedArgs.current_state = JSON.parse(repairJsonString(raw));
+                  } catch {
+                    parsedArgs.current_state = {
+                      evaluation_previous_goal: '',
+                      memory: raw.slice(0, 2000),
+                      next_goal: '',
+                    };
+                  }
+                }
+              }
+              if (parsedArgs.action && typeof parsedArgs.action === 'string') {
+                const rawAction = parsedArgs.action;
+                try {
+                  parsedArgs.action = JSON.parse(rawAction);
+                } catch {
+                  try {
+                    parsedArgs.action = JSON.parse(repairJsonString(rawAction));
+                  } catch {
+                    // keep as-is
+                  }
+                }
+              }
+              
+              try {
+                const validated = this.validateModelOutput(parsedArgs);
+                if (validated) {
+                  logger.debug(`[${this.modelName}] Successfully parsed JSON from tool_calls arguments after structured output failure`);
+                  return validated;
+                }
+              } catch (parseError) {
+                logger.warning(`[${this.modelName}] Failed to validate tool_calls arguments:`, parseError);
+              }
+            }
           }
         }
+        
         throw new Error(`Failed to invoke ${this.modelName} with structured output: \n${errorMessage}`);
       }
 
       // Use type assertion to access the properties
       const rawResponse = response.raw as BaseMessage & {
         tool_calls?: Array<{
-          args: {
-            currentState: typeof agentBrainSchema._type;
-            action: z.infer<ReturnType<typeof buildDynamicActionSchema>>;
+          name?: string;
+          function?: {
+            name?: string;
+            arguments?: string;
           };
+          args?: any; // Can be object (LangChain processed) or string
+          arguments?: string;
+          type?: string;
+          id?: string;
         }>;
       };
 
       // sometimes LLM returns an empty content, but with one or more tool calls, so we need to check the tool calls
       if (rawResponse.tool_calls && rawResponse.tool_calls.length > 0) {
-        logger.info('Navigator structuredLlm tool call with empty content', rawResponse.tool_calls);
-        // only use the first tool call
         const toolCall = rawResponse.tool_calls[0];
-        return {
-          current_state: toolCall.args.currentState,
-          action: [...toolCall.args.action],
-        };
+        logger.debug('Navigator found tool_calls in raw response:', JSON.stringify(toolCall, null, 2));
+        
+        let parsedArgs: any = null;
+        
+        // Handle LangChain's processed tool_calls format (args is already an object)
+        if (toolCall.args && typeof toolCall.args === 'object' && !Array.isArray(toolCall.args)) {
+          logger.info('Navigator: Found LangChain processed tool_call.args (object)');
+          parsedArgs = toolCall.args;
+        }
+        // Handle OpenAI-compatible tool_calls format (function.arguments is a JSON string)
+        else if (toolCall.function?.arguments && typeof toolCall.function.arguments === 'string') {
+          logger.info('Navigator: Found OpenAI format tool_call.function.arguments (string)');
+          try {
+            parsedArgs = JSON.parse(toolCall.function.arguments);
+          } catch (parseError) {
+            logger.warning('Navigator failed to parse tool_calls.function.arguments:', parseError);
+          }
+        }
+        // Handle args as string
+        else if (toolCall.args && typeof toolCall.args === 'string') {
+          logger.info('Navigator: Found tool_call.args (string)');
+          try {
+            parsedArgs = JSON.parse(toolCall.args);
+          } catch (parseError) {
+            logger.warning('Navigator failed to parse tool_call.args string:', parseError);
+          }
+        }
+        // Handle direct arguments field
+        else if (toolCall.arguments && typeof toolCall.arguments === 'string') {
+          logger.info('Navigator: Found tool_call.arguments (string)');
+          try {
+            parsedArgs = JSON.parse(toolCall.arguments);
+          } catch (parseError) {
+            logger.warning('Navigator failed to parse tool_call.arguments:', parseError);
+          }
+        }
+
+        if (parsedArgs && typeof parsedArgs === 'object') {
+          try {
+            // Fix: Handle double-escaped JSON strings in current_state field (repair + fallback)
+            if (parsedArgs.current_state && typeof parsedArgs.current_state === 'string') {
+              const raw = parsedArgs.current_state;
+              try {
+                logger.debug('Navigator: current_state is a string, parsing it as JSON');
+                parsedArgs.current_state = JSON.parse(raw);
+                logger.debug('Navigator: Successfully parsed current_state from string to object');
+              } catch (parseError) {
+                try {
+                  parsedArgs.current_state = JSON.parse(repairJsonString(raw));
+                  logger.debug('Navigator: Parsed current_state after repairJsonString');
+                } catch (repairError) {
+                  logger.warning('Navigator: Failed to parse current_state (parse + repair):', parseError);
+                  parsedArgs.current_state = {
+                    evaluation_previous_goal: '',
+                    memory: raw.slice(0, 2000),
+                    next_goal: '',
+                  };
+                }
+              }
+            }
+
+            // Fix: Handle action field that might be a JSON string instead of an array
+            if (parsedArgs.action && typeof parsedArgs.action === 'string') {
+              const rawAction = parsedArgs.action;
+              try {
+                logger.debug('Navigator: action is a string, parsing it as JSON');
+                parsedArgs.action = JSON.parse(rawAction);
+                logger.debug('Navigator: Successfully parsed action from string to array');
+              } catch (parseError) {
+                try {
+                  parsedArgs.action = JSON.parse(repairJsonString(rawAction));
+                  logger.debug('Navigator: Parsed action after repairJsonString');
+                } catch (repairError) {
+                  logger.warning('Navigator: Failed to parse action (parse + repair):', parseError);
+                }
+              }
+            }
+
+            const validated = this.validateModelOutput(parsedArgs);
+            if (validated) {
+              logger.info('Navigator successfully extracted and validated JSON from tool_calls');
+              return validated;
+            } else {
+              logger.warning('Navigator: validateModelOutput returned undefined');
+            }
+          } catch (validationError) {
+            logger.warning('Navigator failed to validate parsed tool_calls arguments:', validationError);
+            logger.warning('Navigator: Parsed args that failed validation:', JSON.stringify(parsedArgs, null, 2));
+          }
+        } else {
+          logger.warning('Navigator: tool_calls found but could not extract valid arguments. Tool call structure:', JSON.stringify(toolCall, null, 2));
+        }
       }
       throw new ResponseParseError('Could not parse navigator response');
     }
@@ -233,8 +390,6 @@ export class NavigatorAgent extends BaseAgent<z.ZodType, NavigatorResult> {
         throw new ExtensionConflictError(EXTENSION_CONFLICT_ERROR_MESSAGE, error);
       } else if (isForbiddenError(error)) {
         throw new ChatModelForbiddenError(LLM_FORBIDDEN_ERROR_MESSAGE, error);
-      } else if (error instanceof URLNotAllowedError) {
-        throw error;
       }
 
       const errorString = `Navigation failed: ${errorMessage}`;
@@ -430,9 +585,6 @@ export class NavigatorAgent extends BaseAgent<z.ZodType, NavigatorResult> {
         // TODO: wait for 1 second for now, need to optimize this to avoid unnecessary waiting
         await new Promise(resolve => setTimeout(resolve, 1000));
       } catch (error) {
-        if (error instanceof URLNotAllowedError) {
-          throw error;
-        }
         const errorMessage = error instanceof Error ? error.message : String(error);
         logger.error(
           'doAction error',
