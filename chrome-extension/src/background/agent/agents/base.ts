@@ -12,25 +12,6 @@ import { ProviderTypeEnum } from '@extension/storage';
 
 const logger = createLogger('agent');
 
-/**
- * Normalize action args: some providers return switch_tab/close_tab with "id" instead of "tab_id".
- * Mutates the action array in place so validation (Zod schema expecting tab_id) succeeds.
- */
-function normalizeTabIdInActions(parsedArgs: { action?: unknown[] }): void {
-  if (!parsedArgs?.action || !Array.isArray(parsedArgs.action)) return;
-  for (const item of parsedArgs.action) {
-    if (!item || typeof item !== 'object') continue;
-    const obj = item as Record<string, unknown>;
-    for (const key of ['switch_tab', 'close_tab']) {
-      const payload = obj[key];
-      if (payload && typeof payload === 'object' && 'id' in payload && !('tab_id' in payload)) {
-        const p = payload as Record<string, unknown>;
-        p.tab_id = p.id;
-      }
-    }
-  }
-}
-
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type CallOptions = Record<string, any>;
 
@@ -386,9 +367,6 @@ export abstract class BaseAgent<T extends z.ZodType, M = unknown> {
               }
             }
 
-            // Fix: Some providers return switch_tab/close_tab with "id" instead of "tab_id"
-            normalizeTabIdInActions(parsedArgs);
-
             logger.debug(`[${this.modelName}] Validating parsed tool_call arguments`);
             const validated = this.validateModelOutput(parsedArgs);
             if (validated) {
@@ -460,7 +438,6 @@ export abstract class BaseAgent<T extends z.ZodType, M = unknown> {
     try {
       const extractedJson = extractJsonFromModelOutput(cleanedContent);
       logger.debug(`[${this.modelName}] Successfully extracted JSON from content`);
-      normalizeTabIdInActions(extractedJson as { action?: unknown[] });
       return this.validateModelOutput(extractedJson);
     } catch (error) {
       logger.warning(`[${this.modelName}] manuallyParseResponse failed:`, error);

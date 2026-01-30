@@ -1,5 +1,6 @@
 import { type BaseMessage, AIMessage, HumanMessage, SystemMessage, ToolMessage } from '@langchain/core/messages';
 
+import { repairJsonString } from '@src/background/utils';
 import { guardrails } from '@src/background/services/guardrails';
 import { ResponseParseError } from '../agents/errors';
 
@@ -117,19 +118,31 @@ export function extractJsonFromModelOutput(content: string): Record<string, unkn
 
     // If content is wrapped in code blocks, extract just the JSON part
     if (processedContent.includes('```')) {
-      // Find the JSON content between code blocks
       const parts = processedContent.split('```');
-      processedContent = parts[1];
-
-      // Remove language identifier if present (e.g., 'json\n')
-      if (processedContent.startsWith('json')) {
-        processedContent = processedContent.substring(4).trim();
+      const blockContent = parts[1]?.trim();
+      if (blockContent) {
+        processedContent = blockContent;
+        // Remove language identifier if present (e.g. 'json\n', 'JSON\n', 'json ')
+        processedContent = processedContent.replace(/^\s*json\s*/i, '').trim();
       }
     }
 
+    // Helper to parse with optional repair for malformed JSON (e.g. unescaped quotes in strings)
+    const tryParse = (raw: string): Record<string, unknown> => {
+      try {
+        return JSON.parse(raw) as Record<string, unknown>;
+      } catch {
+        try {
+          return JSON.parse(repairJsonString(raw)) as Record<string, unknown>;
+        } catch {
+          throw new Error('JSON parse failed');
+        }
+      }
+    };
+
     // First, try to parse the cleaned content directly
     try {
-      return JSON.parse(processedContent);
+      return tryParse(processedContent);
     } catch {
       // If direct parsing fails (e.g. model returns natural language + JSON),
       // try to heuristically extract the first JSON object block.
@@ -139,7 +152,7 @@ export function extractJsonFromModelOutput(content: string): Record<string, unkn
       if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
         const jsonCandidate = processedContent.slice(firstBrace, lastBrace + 1);
         try {
-          return JSON.parse(jsonCandidate);
+          return tryParse(jsonCandidate);
         } catch (parseError) {
           // If the extracted block still fails, try to find nested JSON blocks
           // by counting braces to find the matching closing brace
@@ -155,7 +168,7 @@ export function extractJsonFromModelOutput(content: string): Record<string, unkn
           }
           if (endIndex > firstBrace) {
             const nestedJsonCandidate = processedContent.slice(firstBrace, endIndex + 1);
-            return JSON.parse(nestedJsonCandidate);
+            return tryParse(nestedJsonCandidate);
           }
           throw parseError;
         }
@@ -167,7 +180,7 @@ export function extractJsonFromModelOutput(content: string): Record<string, unkn
       if (firstBracket !== -1 && lastBracket !== -1 && lastBracket > firstBracket) {
         const jsonArrayCandidate = processedContent.slice(firstBracket, lastBracket + 1);
         try {
-          return JSON.parse(jsonArrayCandidate);
+          return tryParse(jsonArrayCandidate);
         } catch {
           // Try nested bracket matching similar to braces
           let bracketCount = 0;
@@ -182,7 +195,7 @@ export function extractJsonFromModelOutput(content: string): Record<string, unkn
           }
           if (endIndex > firstBracket) {
             const nestedArrayCandidate = processedContent.slice(firstBracket, endIndex + 1);
-            return JSON.parse(nestedArrayCandidate);
+            return tryParse(nestedArrayCandidate);
           }
         }
       }

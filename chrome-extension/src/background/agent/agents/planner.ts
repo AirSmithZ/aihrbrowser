@@ -45,9 +45,70 @@ export const plannerOutputSchema = z.object({
 
 export type PlannerOutput = z.infer<typeof plannerOutputSchema>;
 
+/**
+ * Navigator-shaped object: some gateways return Navigator format (action + current_state)
+ * for all agents. When Planner receives this, we map it to PlannerOutput so execution can continue.
+ */
+interface NavigatorShapedArgs {
+  action?: unknown[];
+  current_state?: {
+    evaluation_previous_goal?: string;
+    memory?: string;
+    next_goal?: string;
+  };
+}
+
+function isNavigatorShaped(obj: unknown): obj is NavigatorShapedArgs {
+  if (!obj || typeof obj !== 'object') return false;
+  const o = obj as Record<string, unknown>;
+  return (
+    Array.isArray(o.action) &&
+    !!o.current_state &&
+    typeof o.current_state === 'object'
+  );
+}
+
+/**
+ * Map Navigator-shaped tool_call args to PlannerOutput. Used when gateway returns
+ * Navigator format for Planner (e.g. single tool schema for all agents).
+ */
+export function mapNavigatorShapeToPlannerOutput(parsedArgs: NavigatorShapedArgs): PlannerOutput {
+  const state = parsedArgs.current_state ?? {};
+  const memory = typeof state.memory === 'string' ? state.memory : '';
+  const nextGoal = typeof state.next_goal === 'string' ? state.next_goal : '';
+  const evalPrev = typeof state.evaluation_previous_goal === 'string' ? state.evaluation_previous_goal : '';
+  const observation = [evalPrev, nextGoal].filter(Boolean).join(' ') || memory.slice(0, 500) || '当前状态已更新';
+  const actionDesc =
+    Array.isArray(parsedArgs.action) && parsedArgs.action.length > 0
+      ? JSON.stringify(parsedArgs.action)
+      : '';
+  const next_steps = nextGoal || (actionDesc ? `执行动作: ${actionDesc}` : '继续执行当前计划');
+  return {
+    observation,
+    challenges: '',
+    done: false,
+    next_steps,
+    final_answer: '',
+    reasoning: '网关返回了 Navigator 格式，已转换为计划步骤继续执行。',
+    web_task: true,
+  };
+}
+
 export class PlannerAgent extends BaseAgent<typeof plannerOutputSchema, PlannerOutput> {
   constructor(options: BaseAgentOptions, extraOptions?: Partial<ExtraAgentOptions>) {
     super(plannerOutputSchema, options, { ...extraOptions, id: 'planner' });
+  }
+
+  /**
+   * When gateway returns Navigator-shaped output for Planner, map it to PlannerOutput
+   * so we don't fail with schema validation.
+   */
+  tryMapNavigatorShapeToOutput(
+    parsedArgs: Record<string, unknown>,
+  ): PlannerOutput | undefined {
+    if (!isNavigatorShaped(parsedArgs)) return undefined;
+    logger.debug('[PlannerAgent] Mapping Navigator-shaped response to PlannerOutput');
+    return mapNavigatorShapeToPlannerOutput(parsedArgs as NavigatorShapedArgs);
   }
 
   async execute(): Promise<AgentOutput<PlannerOutput>> {
@@ -78,7 +139,6 @@ export class PlannerAgent extends BaseAgent<typeof plannerOutputSchema, PlannerO
       }
 
       const modelOutput = await this.invoke(plannerMessages);
-      console.log('modelOutput', modelOutput);
       if (!modelOutput) {
         throw new Error('Failed to validate planner output');
       }

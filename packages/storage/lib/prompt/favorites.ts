@@ -5,13 +5,13 @@ import type { BaseStorage } from '../base/types';
 // Template data
 const defaultFavoritePrompts = [
   {
-    title: '📚 Explore AI Papers',
+    title: '📚  小说下载任务',
     content:
-      '- Go to https://huggingface.co/papers and click through each of the first 3 papers.\n- For each paper:\n  - Record the title, URL and upvotes\n  - Summarise the abstract section\n- Finally, compile together a summary of all 3 papers, ranked by upvotes',
+      '下载一篇奇幻小说，一篇历史小说，一篇热门小说，地址为https://www.haodoo.net/?M=Share&P=1010490775#gsc.tab=0。',
   },
   {
-    title: '🐦 Follow us on X/Twitter!',
-    content: 'Follow us at https://x.com/nanobrowser_ai to stay updated on the latest news and features!',
+    title: '🐦 电子书下载任务',
+    content: '下载电子书，https://zh.welib.org/slow_download/df8d45ab486d6b2dd722421887cbdeca/0/0',
   },
   {
     title: '🌟 下载三个不同主题的艺术设计的ppt',
