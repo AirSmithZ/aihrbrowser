@@ -7,7 +7,7 @@ const defaultFavoritePrompts = [
   {
     title: '📚  小说下载任务',
     content:
-      '下载一篇奇幻小说，一篇历史小说，一篇热门小说，地址为https://www.haodoo.net/?M=Share&P=1010490775#gsc.tab=0。',
+      '下载一篇历史小说，地址为https://www.haodoo.net',
   },
   {
     title: '🐦 电子书下载任务',
@@ -16,7 +16,7 @@ const defaultFavoritePrompts = [
   {
     title: '🌟 下载三个不同主题的艺术设计的ppt',
     content:
-      "在https://www.1ppt.com/中搜索三个不同的主题的关于艺术设计的ppt并下载",
+      "在https://www.1ppt.com/中搜索下载一篇关于艺术设计的ppt",
   },
 ];
 
