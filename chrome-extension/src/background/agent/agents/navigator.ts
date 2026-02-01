@@ -7,10 +7,12 @@ import { buildDynamicActionSchema } from '../actions/builder';
 import { agentBrainSchema } from '../types';
 import { type BaseMessage, HumanMessage } from '@langchain/core/messages';
 import { Actors, ExecutionState } from '../event/types';
+import { t } from '@extension/i18n';
 import {
   ChatModelAuthError,
   ChatModelBadRequestError,
   ChatModelForbiddenError,
+  ChatModelServiceUnavailableError,
   EXTENSION_CONFLICT_ERROR_MESSAGE,
   ExtensionConflictError,
   isAbortedError,
@@ -18,10 +20,13 @@ import {
   isBadRequestError,
   isExtensionConflictError,
   isForbiddenError,
+  isServiceUnavailableError,
   ResponseParseError,
   LLM_FORBIDDEN_ERROR_MESSAGE,
   RequestCancelledError,
 } from './errors';
+import { extractUsage, logLLMUsage } from '../llm-usage-log';
+import { extractJsonFromModelOutput, removeThinkTags } from '../messages/utils';
 import { calcBranchPathHashSet } from '@src/background/browser/dom/views';
 import { type BrowserState, BrowserStateHistory } from '@src/background/browser/views';
 import { convertZodToJsonSchema, repairJsonString } from '@src/background/utils';
@@ -37,6 +42,11 @@ interface ParsedModelOutput {
   };
   action?: (Record<string, unknown> | null)[] | null;
 }
+
+/** Model may return these names; map to registered action names. */
+const ACTION_NAME_ALIASES: Record<string, string> = {
+  switch_to_tab: 'switch_tab',
+};
 
 export class NavigatorActionRegistry {
   private actions: Record<string, Action> = {};
@@ -56,7 +66,8 @@ export class NavigatorActionRegistry {
   }
 
   getAction(name: string): Action | undefined {
-    return this.actions[name];
+    const resolved = ACTION_NAME_ALIASES[name] ?? name;
+    return this.actions[resolved];
   }
 
   setupModelOutputSchema(): z.ZodType {
@@ -91,6 +102,8 @@ export class NavigatorAgent extends BaseAgent<z.ZodType, NavigatorResult> {
   }
 
   async invoke(inputMessages: BaseMessage[]): Promise<this['ModelOutput']> {
+    const startMs = Date.now();
+
     // Use structured output
     if (this.withStructuredOutput) {
       const structuredLlm = this.chatLLM.withStructuredOutput(this.jsonSchema, {
@@ -104,6 +117,10 @@ export class NavigatorAgent extends BaseAgent<z.ZodType, NavigatorResult> {
           signal: this.context.controller.signal,
           ...this.callOptions,
         });
+
+        const elapsedMs = Date.now() - startMs;
+        const usage = response?.raw ? extractUsage(response.raw) : null;
+        logLLMUsage(this.id, this.modelName, usage, elapsedMs);
 
         if (response.parsed) {
           return response.parsed;
@@ -390,6 +407,8 @@ export class NavigatorAgent extends BaseAgent<z.ZodType, NavigatorResult> {
         throw new ExtensionConflictError(EXTENSION_CONFLICT_ERROR_MESSAGE, error);
       } else if (isForbiddenError(error)) {
         throw new ChatModelForbiddenError(LLM_FORBIDDEN_ERROR_MESSAGE, error);
+      } else if (isServiceUnavailableError(error)) {
+        throw new ChatModelServiceUnavailableError(t('exec_errors_serviceUnavailable'), error);
       }
 
       const errorString = `Navigation failed: ${errorMessage}`;
@@ -483,6 +502,48 @@ export class NavigatorAgent extends BaseAgent<z.ZodType, NavigatorResult> {
   }
 
   /**
+   * Relaxed fallback when strict schema validation fails: normalize current_state and action
+   * so that fixActions/doMultiAction can still execute (e.g. GLM returns valid shape but schema differs).
+   */
+  private tryRelaxedNavigatorOutput(parsed: Record<string, unknown>): this['ModelOutput'] | undefined {
+    const cs = parsed.current_state;
+    const actionRaw = parsed.action;
+    if (!cs || typeof cs !== 'object' || !Array.isArray(actionRaw) || actionRaw.length === 0) return undefined;
+    const state = cs as Record<string, unknown>;
+    const evaluation_previous_goal =
+      typeof state.evaluation_previous_goal === 'string' ? state.evaluation_previous_goal : '';
+    const memory = typeof state.memory === 'string' ? state.memory : '';
+    const next_goal = typeof state.next_goal === 'string' ? state.next_goal : '';
+    const action: Record<string, unknown>[] = [];
+    for (const item of actionRaw) {
+      if (item && typeof item === 'object' && !Array.isArray(item)) {
+        const keys = Object.keys(item as object).filter(k => (item as Record<string, unknown>)[k] != null);
+        if (keys.length === 1) action.push({ [keys[0]]: (item as Record<string, unknown>)[keys[0]] });
+      }
+    }
+    if (action.length === 0) return undefined;
+    const normalized = {
+      current_state: { evaluation_previous_goal, memory, next_goal },
+      action,
+    };
+    const validated = this.validateModelOutput(normalized);
+    if (validated) return validated;
+    return normalized as this['ModelOutput'];
+  }
+
+  protected override manuallyParseResponse(content: string): this['ModelOutput'] | undefined {
+    const out = super.manuallyParseResponse(content);
+    if (out) return out;
+    try {
+      const cleaned = removeThinkTags(content);
+      const extracted = extractJsonFromModelOutput(cleaned);
+      return this.tryRelaxedNavigatorOutput(extracted);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
    * Fix the actions to be an array of objects, sometimes the action is a string or an object
    * @param response
    * @returns
@@ -490,8 +551,12 @@ export class NavigatorAgent extends BaseAgent<z.ZodType, NavigatorResult> {
   private fixActions(response: this['ModelOutput']): Record<string, unknown>[] {
     let actions: Record<string, unknown>[] = [];
     if (Array.isArray(response.action)) {
-      // if the item is null, skip it
-      actions = response.action.filter((item: unknown) => item !== null);
+      // skip null and items that are not single-key objects (avoids "Action undefined not exists")
+      actions = response.action.filter((item: unknown) => {
+        if (item === null || typeof item !== 'object' || Array.isArray(item)) return false;
+        const keys = Object.keys(item as object).filter(k => (item as Record<string, unknown>)[k] != null);
+        return keys.length === 1 && !!keys[0];
+      }) as Record<string, unknown>[];
       if (actions.length === 0) {
         logger.warning('No valid actions found', response.action);
       }
@@ -536,6 +601,14 @@ export class NavigatorAgent extends BaseAgent<z.ZodType, NavigatorResult> {
         // check if the task is paused or stopped
         if (this.context.paused || this.context.stopped) {
           return results;
+        }
+
+        if (actionName === undefined || actionName === '') {
+          logger.warning('Skipping action with no name', { action, index: i });
+          results.push(
+            new ActionResult({ error: 'Action has no name', isDone: false, includeInMemory: true }),
+          );
+          continue;
         }
 
         const actionInstance = this.actionRegistry.getAction(actionName);

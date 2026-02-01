@@ -511,6 +511,9 @@
   "exec_errors_maxFailuresReached": {
     "message": "Máximo de falhas atingido"
   },
+  "exec_errors_serviceUnavailable": {
+    "message": "Serviço da API temporariamente indisponível (503). Tente novamente em alguns minutos."
+  },
   "exec_task_cancel": {
     "message": "Tarefa cancelada"
   },

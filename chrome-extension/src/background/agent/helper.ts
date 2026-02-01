@@ -1,4 +1,5 @@
 import { type ProviderConfig, type ModelConfig, ProviderTypeEnum } from '@extension/storage';
+import { storeRequestLog } from '@src/background/services/requestLog';
 import { ChatOpenAI, AzureChatOpenAI } from '@langchain/openai';
 import { ChatAnthropic } from '@langchain/anthropic';
 import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
@@ -22,6 +23,7 @@ class ChatLlama extends ChatOpenAI {
     try {
       // Make the request using the parent's implementation
       const response = await super.completionWithRetry(request, options);
+      if (response?.id) storeRequestLog(response.id, response);
 
       // Check if this is a Llama API response format
       if (response?.completion_message?.content?.text) {
@@ -59,6 +61,38 @@ class ChatLlama extends ChatOpenAI {
   }
 }
 
+/**
+ * Extract assistant text from gateway response when content may be in non-standard fields.
+ * Some gateways return message.text, message.parts, or Anthropic-style content blocks.
+ */
+function extractMessageContentFromRaw(firstChoice: any, message: any): string | null {
+  if (!message) return null;
+  // Standard OpenAI: message.content (string)
+  if (typeof message.content === 'string' && message.content.trim()) return message.content;
+  // Common alternates: message.text, message.response
+  if (typeof message.text === 'string' && message.text.trim()) return message.text;
+  if (typeof message.response === 'string' && message.response.trim()) return message.response;
+  // Legacy: choices[0].text
+  if (typeof firstChoice?.text === 'string' && firstChoice.text.trim()) return firstChoice.text;
+  // Anthropic-style content blocks: message.content = [{ type: "text", text: "..." }]
+  if (Array.isArray(message.content) && message.content.length > 0) {
+    const parts = message.content
+      .filter((b: any) => b?.type === 'text' && typeof b.text === 'string')
+      .map((b: any) => b.text)
+      .join('');
+    if (parts.trim()) return parts;
+  }
+  // message.parts (some gateways)
+  if (Array.isArray(message.parts) && message.parts.length > 0) {
+    const parts = message.parts
+      .filter((b: any) => typeof b?.text === 'string')
+      .map((b: any) => b.text)
+      .join('');
+    if (parts.trim()) return parts;
+  }
+  return null;
+}
+
 // Custom Chat model for Claude-style models served via OpenAI-compatible gateways (e.g. api520)
 // These providers often return tool_calls with an AgentOutput function whose arguments contain
 // the actual JSON we need. This wrapper flattens that into a plain JSON string in message.content
@@ -72,6 +106,7 @@ class ChatClaudeToolProxy extends ChatOpenAI {
   async completionWithRetry(request: any, options?: any): Promise<any> {
     try {
       const response = await super.completionWithRetry(request, options);
+      if (response?.id) storeRequestLog(response.id, response);
 
       console.log('[ChatClaudeToolProxy] Raw response received, checking for tool_calls...');
       console.log('[ChatClaudeToolProxy] Response structure:', {
@@ -149,6 +184,24 @@ class ChatClaudeToolProxy extends ChatOpenAI {
           }
         } else {
           console.log('[ChatClaudeToolProxy] No tool_calls found in response, returning original');
+        }
+
+        // Fallback: gateway returned message with no content and no tool_calls; try non-standard fields
+        const hasContent =
+          typeof message?.content === 'string' && message.content.trim().length > 0;
+        const hasToolCalls =
+          Array.isArray(message?.tool_calls) && message.tool_calls.length > 0;
+        if (!hasContent && !hasToolCalls && firstChoice && message) {
+          const extracted = extractMessageContentFromRaw(firstChoice, message);
+          if (extracted) {
+            const transformedMessage: any = { role: 'assistant', content: extracted };
+            const transformed = {
+              ...response,
+              choices: [{ ...firstChoice, message: transformedMessage }],
+            };
+            console.log('[ChatClaudeToolProxy] Filled message.content from non-standard field, length:', extracted.length);
+            return transformed;
+          }
         }
       } catch (innerError) {
         console.error('[ChatClaudeToolProxy] Failed to transform tool_calls response, falling back to original:', innerError);
@@ -279,8 +332,18 @@ function createOpenAIChatModel(
     return new ChatClaudeToolProxy(args);
   }
 
+  // Use wrapper that stores API response + console logs by request id
   console.log('[createOpenAIChatModel] Using standard ChatOpenAI for model:', modelConfig.modelName);
-  return new ChatOpenAI(args);
+  return new ChatOpenAIWithRequestLog(args);
+}
+
+/** Thin wrapper to store raw API response and console logs by response.id */
+class ChatOpenAIWithRequestLog extends ChatOpenAI {
+  async completionWithRetry(request: any, options?: any): Promise<any> {
+    const response = await super.completionWithRetry(request, options);
+    if (response?.id) storeRequestLog(response.id, response);
+    return response;
+  }
 }
 
 // Function to extract instance name from Azure endpoint URL

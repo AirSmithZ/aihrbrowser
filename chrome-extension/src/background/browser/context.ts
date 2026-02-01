@@ -133,6 +133,12 @@ export default class BrowserContext {
     return new Set(tabs.map(tab => tab.id).filter(id => id !== undefined));
   }
 
+  /** Default timeout for tab operations (e.g. switch). */
+  private static readonly TAB_OPERATION_TIMEOUT_MS = 5000;
+
+  /** Timeout for navigation (openTab / navigateTo); longer to allow slow pages to load. */
+  private static readonly TAB_NAVIGATION_TIMEOUT_MS = 20000;
+
   /**
    * Wait for tab events to occur after a tab is created or updated.
    * @param tabId - The ID of the tab to wait for events on.
@@ -147,7 +153,8 @@ export default class BrowserContext {
       timeoutMs?: number;
     } = {},
   ): Promise<void> {
-    const { waitForUpdate = true, waitForActivation = true, timeoutMs = 5000 } = options;
+    const { waitForUpdate = true, waitForActivation = true, timeoutMs = BrowserContext.TAB_OPERATION_TIMEOUT_MS } =
+      options;
 
     const promises: Promise<void>[] = [];
 
@@ -240,9 +247,9 @@ export default class BrowserContext {
     }
     //  Use chrome.tabs.update only if the page is not attached
     const tabId = page.tabId;
-    // Update tab and wait for events
+    // Update tab and wait for events (longer timeout for navigation so slow pages can load)
     await chrome.tabs.update(tabId, { url, active: true });
-    await this.waitForTabEvents(tabId);
+    await this.waitForTabEvents(tabId, { timeoutMs: BrowserContext.TAB_NAVIGATION_TIMEOUT_MS });
 
     // Reattach the page after navigation completes
     const updatedPage = await this._getOrCreatePage(await chrome.tabs.get(tabId), true);
@@ -256,8 +263,8 @@ export default class BrowserContext {
     if (!tab.id) {
       throw new Error('No tab ID available');
     }
-    // Wait for tab events
-    await this.waitForTabEvents(tab.id);
+    // Wait for tab events (longer timeout so slow pages like 1ppt.com can load)
+    await this.waitForTabEvents(tab.id, { timeoutMs: BrowserContext.TAB_NAVIGATION_TIMEOUT_MS });
 
     // Get updated tab information
     const updatedTab = await chrome.tabs.get(tab.id);

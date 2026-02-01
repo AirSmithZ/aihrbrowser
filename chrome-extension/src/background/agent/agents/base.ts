@@ -5,6 +5,7 @@ import type { BasePrompt } from '../prompts/base';
 import type { BaseMessage } from '@langchain/core/messages';
 import { createLogger } from '@src/background/log';
 import type { Action } from '../actions/builder';
+import { extractUsage, logLLMUsage } from '../llm-usage-log';
 import { convertInputMessages, extractJsonFromModelOutput, removeThinkTags } from '../messages/utils';
 import { isAbortedError, ResponseParseError } from './errors';
 import { repairJsonString } from '@src/background/utils';
@@ -110,6 +111,16 @@ export abstract class BaseAgent<T extends z.ZodType, M = unknown> {
       return false;
     }
 
+    const lowerName = this.modelName.toLowerCase();
+    // GLM (e.g. GLM-4.7) often returns JSON/custom formats in message.content instead of tool_calls;
+    // use manual extraction so we parse content (including <tool_call>AgentOutput and ```json blocks).
+    if (lowerName.includes('glm') || lowerName.includes('glm-4')) {
+      logger.debug(
+        `[${this.modelName}] Detected GLM-style model, disabling structured output and using manual JSON extraction`,
+      );
+      return false;
+    }
+
     // Llama API models don't support json_schema response format
     if (this.provider === ProviderTypeEnum.Llama || this.isLlamaModel(this.modelName)) {
       logger.debug(`[${this.modelName}] Llama API doesn't support structured output, using manual JSON extraction`);
@@ -119,7 +130,6 @@ export abstract class BaseAgent<T extends z.ZodType, M = unknown> {
     // Claude 系列模型通过部分网关返回的 structured output / json_schema 支持并不稳定，
     // 更可靠的方式是依赖我们自定义的 ChatClaudeToolProxy + 手动 JSON 抽取逻辑。
     // 因此如果模型名里包含 claude/sonnet-4-5/haiku-4-5，则关闭 structured output。
-    const lowerName = this.modelName.toLowerCase();
     if (lowerName.includes('claude') || lowerName.includes('sonnet-4-5') || lowerName.includes('haiku-4-5')) {
       logger.debug(
         `[${this.modelName}] Detected Claude-style model, disabling structured output and using manual JSON extraction`,
@@ -132,6 +142,8 @@ export abstract class BaseAgent<T extends z.ZodType, M = unknown> {
   }
 
   async invoke(inputMessages: BaseMessage[]): Promise<this['ModelOutput']> {
+    const startMs = Date.now();
+
     // Use structured output
     if (this.withStructuredOutput) {
       logger.debug(`[${this.modelName}] Preparing structured output call with schema:`, {
@@ -152,6 +164,10 @@ export abstract class BaseAgent<T extends z.ZodType, M = unknown> {
           signal: this.context.controller.signal,
           ...this.callOptions,
         });
+
+        const elapsedMs = Date.now() - startMs;
+        const usage = response?.raw ? extractUsage(response.raw) : null;
+        logLLMUsage(this.id, this.modelName, usage, elapsedMs);
 
         logger.debug(`[${this.modelName}] LLM response received:`, {
           hasParsed: !!response.parsed,
@@ -263,6 +279,10 @@ export abstract class BaseAgent<T extends z.ZodType, M = unknown> {
         signal: this.context.controller.signal,
         ...this.callOptions,
       });
+
+      const elapsedMs = Date.now() - startMs;
+      const usage = extractUsage(response);
+      logLLMUsage(this.id, this.modelName, usage, elapsedMs);
 
       // Debug: Log response structure
       logger.debug(`[${this.modelName}] Response type: ${response.constructor.name}`);
@@ -386,7 +406,7 @@ export abstract class BaseAgent<T extends z.ZodType, M = unknown> {
       }
 
       // Second, try to parse from content string
-      if (typeof response.content === 'string') {
+      if (typeof response.content === 'string' && response.content.trim()) {
         const parsed = this.manuallyParseResponse(response.content);
         if (parsed) {
           logger.debug(`[${this.modelName}] Successfully parsed JSON from response.content`);
@@ -408,6 +428,22 @@ export abstract class BaseAgent<T extends z.ZodType, M = unknown> {
           }
         }
       }
+
+      // Build a clear error when message has no usable content (common with bad gateway mapping)
+      const hasContent =
+        (typeof response.content === 'string' && response.content.length > 0) || Array.isArray(response.content);
+      const hasToolCalls =
+        Array.isArray(responseAny.tool_calls) && responseAny.tool_calls.length > 0;
+      if (!hasContent && !hasToolCalls) {
+        logger.error(`[${this.modelName}] API returned message with no content and no tool_calls`, {
+          contentType: typeof response.content,
+          contentLength: typeof response.content === 'string' ? response.content.length : 0,
+        });
+        throw new ResponseParseError(
+          'Could not parse response: API returned message with no content and no tool_calls. ' +
+            'Ensure your API gateway returns either message.content (JSON string) or message.tool_calls in OpenAI format.',
+        );
+      }
     } catch (error) {
       logger.error(`[${this.modelName}] LLM call failed in manual extraction mode:`, error);
       throw error;
@@ -420,15 +456,13 @@ export abstract class BaseAgent<T extends z.ZodType, M = unknown> {
   // Execute the agent and return the result
   abstract execute(): Promise<AgentOutput<M>>;
 
-  // Helper method to validate metadata
+  // Helper method to validate metadata (uses safeParse so callers can try relaxed fallback)
   protected validateModelOutput(data: unknown): this['ModelOutput'] | undefined {
     if (!this.modelOutputSchema || !data) return undefined;
-    try {
-      return this.modelOutputSchema.parse(data);
-    } catch (error) {
-      logger.error('validateModelOutput', error);
-      throw new ResponseParseError('Could not validate model output');
-    }
+    const result = this.modelOutputSchema.safeParse(data);
+    if (result.success) return result.data as this['ModelOutput'];
+    logger.warning('validateModelOutput failed', result.error.message);
+    return undefined;
   }
 
   // Helper method to manually parse the response content

@@ -1009,7 +1009,7 @@ const SidePanel = () => {
                 </div>
                 <div className="flex flex-col">
                   <span className="text-sm font-semibold text-slate-50">AIHR</span>
-                  <span className="text-[11px] text-slate-400">AI Web Agent for your browsing</span>
+                  <span className="text-[11px] text-slate-400">您的浏览AI网络代理</span>
                 </div>
               </div>
             )}

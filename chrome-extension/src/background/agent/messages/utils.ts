@@ -42,6 +42,42 @@ export function removeThinkTags(text: string): string {
 }
 
 /**
+ * Extract Navigator-style output from GLM <tool_call>AgentOutput<arg_key>...</arg_key><arg_value>...</arg_value></tool_call>.
+ * @param content - Raw message content that may contain the tool_call format
+ * @returns { current_state, action } or null if not this format or parse fails
+ */
+export function extractAgentOutputFromToolCall(
+  content: string,
+): { current_state: Record<string, unknown>; action: unknown[] } | null {
+  if (!content || !content.includes('<arg_key>')) {
+    return null;
+  }
+  const currentStateMatch = content.match(/<arg_key>current_state<\/arg_key>\s*<arg_value>([\s\S]*?)<\/arg_value>/);
+  const actionMatch = content.match(/<arg_key>action<\/arg_key>\s*<arg_value>([\s\S]*?)<\/arg_value>/);
+  if (!currentStateMatch?.[1] || !actionMatch?.[1]) {
+    return null;
+  }
+  const tryParseJson = (raw: string): unknown => {
+    try {
+      return JSON.parse(raw);
+    } catch {
+      try {
+        return JSON.parse(repairJsonString(raw));
+      } catch {
+        return null;
+      }
+    }
+  };
+  const current_state = tryParseJson(currentStateMatch[1].trim()) as Record<string, unknown> | null;
+  const actionRaw = tryParseJson(actionMatch[1].trim());
+  const action = Array.isArray(actionRaw) ? actionRaw : actionRaw != null ? [actionRaw] : [];
+  if (!current_state || typeof current_state !== 'object') {
+    return null;
+  }
+  return { current_state, action };
+}
+
+/**
  * Extract JSON from model output, handling both plain JSON and code-block-wrapped JSON.
  * @param content - The string content that potentially contains JSON.
  * @returns Parsed JSON object
@@ -116,14 +152,29 @@ export function extractJsonFromModelOutput(content: string): Record<string, unkn
       throw new Error('Python tag structure does not contain valid parameters');
     }
 
-    // If content is wrapped in code blocks, extract just the JSON part
+    // Handle GLM-style <tool_call>AgentOutput<arg_key>...</arg_key><arg_value>...</arg_value></tool_call>
+    if (processedContent.includes('<tool_call>AgentOutput') || processedContent.includes('<tool_call>')) {
+      const extracted = extractAgentOutputFromToolCall(processedContent);
+      if (extracted) {
+        return extracted as Record<string, unknown>;
+      }
+    }
+
+    // If content is wrapped in code blocks, extract the JSON block (e.g. ```json\n{...}\n```)
     if (processedContent.includes('```')) {
-      const parts = processedContent.split('```');
-      const blockContent = parts[1]?.trim();
-      if (blockContent) {
-        processedContent = blockContent;
-        // Remove language identifier if present (e.g. 'json\n', 'JSON\n', 'json ')
-        processedContent = processedContent.replace(/^\s*json\s*/i, '').trim();
+      // Prefer: first block that looks like ```json or ``` followed by optional lang then newline and content to next ```
+      const codeBlockMatch = processedContent.match(/```(?:json)?\s*\n([\s\S]*?)```/i);
+      if (codeBlockMatch?.[1]) {
+        const blockContent = codeBlockMatch[1].trim();
+        // Remove language identifier if still present at start (e.g. 'json\n', 'JSON ')
+        processedContent = blockContent.replace(/^\s*json\s*/i, '').trim();
+      } else {
+        // Fallback: split by ``` and take first non-empty block after optional "json"
+        const parts = processedContent.split('```');
+        const blockContent = parts[1]?.trim();
+        if (blockContent) {
+          processedContent = blockContent.replace(/^\s*json\s*/i, '').trim();
+        }
       }
     }
 

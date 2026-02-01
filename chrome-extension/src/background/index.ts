@@ -14,6 +14,7 @@ import { createChatModel } from './agent/helper';
 import type { BaseChatModel } from '@langchain/core/language_models/chat_models';
 import { DEFAULT_AGENT_OPTIONS } from './agent/types';
 import { SpeechToTextService } from './services/speechToText';
+import { saveTaskEndLog } from './services/requestLog';
 import { injectBuildDomTreeScripts } from './browser/dom/service';
 
 const logger = createLogger('background');
@@ -471,10 +472,21 @@ async function subscribeToExecutorEvents(executor: Executor) {
       logger.error('Failed to send message to side panel:', error);
     }
 
+    // Persist logs whenever task terminates (ok, fail, cancel, pause)
     if (
       event.state === ExecutionState.TASK_OK ||
       event.state === ExecutionState.TASK_FAIL ||
-      event.state === ExecutionState.TASK_CANCEL
+      event.state === ExecutionState.TASK_CANCEL ||
+      event.state === ExecutionState.TASK_PAUSE
+    ) {
+      saveTaskEndLog(event.data.taskId, event.state, event.data.details);
+    }
+
+    if (
+      event.state === ExecutionState.TASK_OK ||
+      event.state === ExecutionState.TASK_FAIL ||
+      event.state === ExecutionState.TASK_CANCEL ||
+      event.state === ExecutionState.TASK_PAUSE
     ) {
       await currentExecutor?.cleanup();
     }

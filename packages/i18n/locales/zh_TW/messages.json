@@ -505,6 +505,9 @@
   "exec_errors_maxFailuresReached": {
     "message": "已達失敗次數上限。"
   },
+  "exec_errors_serviceUnavailable": {
+    "message": "API 服務暫時無法使用（503），請稍後再試。"
+  },
   "exec_task_cancel": {
     "message": "任務已取消"
   },

@@ -14,9 +14,9 @@ const defaultFavoritePrompts = [
     content: '下载电子书，https://zh.welib.org/slow_download/df8d45ab486d6b2dd722421887cbdeca/0/0',
   },
   {
-    title: '🌟 下载三个不同主题的艺术设计的ppt',
+    title: '🌟 下载一个艺术设计的ppt',
     content:
-      "在https://www.1ppt.com/中搜索下载一篇关于艺术设计的ppt",
+      "打开https://www.1ppt.com/，搜索下载一篇关于艺术设计的ppt",
   },
 ];
 

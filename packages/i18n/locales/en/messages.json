@@ -62,10 +62,10 @@
     "message": "Replay"
   },
   "chat_buttons_send": {
-    "message": "Send"
+    "message": "发送"
   },
   "chat_input_placeholder": {
-    "message": "What can I help you with?"
+    "message": "输入任务内容"
   },
   "chat_input_form": {
     "message": "Chat input form"
@@ -86,7 +86,7 @@
     "message": "Delete session"
   },
   "chat_bookmarks_header": {
-    "message": "Quick Start"
+    "message": "快速开始"
   },
   "chat_bookmarks_saveEdit": {
     "message": "Save changes"
@@ -511,6 +511,9 @@
   },
   "exec_errors_maxFailuresReached": {
     "message": "Max failures reached"
+  },
+  "exec_errors_serviceUnavailable": {
+    "message": "API service temporarily unavailable (503). Please try again in a few minutes."
   },
   "exec_task_cancel": {
     "message": "Task cancelled"

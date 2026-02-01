@@ -4,14 +4,17 @@ import { z } from 'zod';
 import type { AgentOutput } from '../types';
 import { HumanMessage } from '@langchain/core/messages';
 import { Actors, ExecutionState } from '../event/types';
+import { t } from '@extension/i18n';
 import {
   ChatModelAuthError,
   ChatModelBadRequestError,
   ChatModelForbiddenError,
+  ChatModelServiceUnavailableError,
   isAbortedError,
   isAuthenticationError,
   isBadRequestError,
   isForbiddenError,
+  isServiceUnavailableError,
   LLM_FORBIDDEN_ERROR_MESSAGE,
   RequestCancelledError,
 } from './errors';
@@ -179,6 +182,8 @@ export class PlannerAgent extends BaseAgent<typeof plannerOutputSchema, PlannerO
         throw new RequestCancelledError(errorMessage);
       } else if (isForbiddenError(error)) {
         throw new ChatModelForbiddenError(LLM_FORBIDDEN_ERROR_MESSAGE, error);
+      } else if (isServiceUnavailableError(error)) {
+        throw new ChatModelServiceUnavailableError(t('exec_errors_serviceUnavailable'), error);
       }
 
       logger.error(`Planning failed: ${errorMessage}`);

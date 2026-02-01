@@ -136,6 +136,37 @@ export function isForbiddenError(error: unknown): boolean {
 }
 
 /**
+ * Checks if an error is HTTP 503 Service Unavailable (API overload, maintenance, or transient).
+ *
+ * @param error - The error to check
+ * @returns boolean indicating if it's a 503 Service Unavailable error
+ */
+export function isServiceUnavailableError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const msg = error.message;
+  return msg.includes(' 503') || msg.includes('HTTP 503') || /\(HTTP 503\)/.test(msg) || /"code":\s*503/.test(msg);
+}
+
+/**
+ * Custom error class for LLM API 503 Service Unavailable (transient, retry later).
+ */
+export class ChatModelServiceUnavailableError extends Error {
+  constructor(
+    message: string,
+    public readonly cause?: unknown,
+  ) {
+    super(message);
+    this.name = 'ChatModelServiceUnavailableError';
+    if (Error.captureStackTrace) {
+      Error.captureStackTrace(this, ChatModelServiceUnavailableError);
+    }
+  }
+  toString(): string {
+    return `${this.name}: ${this.message}${this.cause ? ` (Caused by: ${this.cause})` : ''}`;
+  }
+}
+
+/**
  * Checks if an error is related to 400 Bad Request
  *
  * @param error - The error to check

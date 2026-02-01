@@ -47,6 +47,8 @@ export class AgentContext {
   stepInfo: AgentStepInfo | null;
   actionResults: ActionResult[];
   stateMessageAdded: boolean;
+  /** When true, planner state will include a hint to mark task done (used after same step executed multiple times). */
+  repeatedStepHint: boolean;
   history: AgentStepHistory;
   finalAnswer: string | null;
 
@@ -71,6 +73,7 @@ export class AgentContext {
     this.stepInfo = null;
     this.actionResults = [];
     this.stateMessageAdded = false;
+    this.repeatedStepHint = false;
     this.history = new AgentStepHistory();
     this.finalAnswer = null;
   }
