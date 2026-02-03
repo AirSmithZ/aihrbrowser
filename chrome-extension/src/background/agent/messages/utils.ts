@@ -1,6 +1,5 @@
 import { type BaseMessage, AIMessage, HumanMessage, SystemMessage, ToolMessage } from '@langchain/core/messages';
 
-import { repairJsonString } from '@src/background/utils';
 import { guardrails } from '@src/background/services/guardrails';
 import { ResponseParseError } from '../agents/errors';
 
@@ -42,48 +41,20 @@ export function removeThinkTags(text: string): string {
 }
 
 /**
- * Extract Navigator-style output from GLM <tool_call>AgentOutput<arg_key>...</arg_key><arg_value>...</arg_value></tool_call>.
- * @param content - Raw message content that may contain the tool_call format
- * @returns { current_state, action } or null if not this format or parse fails
- */
-export function extractAgentOutputFromToolCall(
-  content: string,
-): { current_state: Record<string, unknown>; action: unknown[] } | null {
-  if (!content || !content.includes('<arg_key>')) {
-    return null;
-  }
-  const currentStateMatch = content.match(/<arg_key>current_state<\/arg_key>\s*<arg_value>([\s\S]*?)<\/arg_value>/);
-  const actionMatch = content.match(/<arg_key>action<\/arg_key>\s*<arg_value>([\s\S]*?)<\/arg_value>/);
-  if (!currentStateMatch?.[1] || !actionMatch?.[1]) {
-    return null;
-  }
-  const tryParseJson = (raw: string): unknown => {
-    try {
-      return JSON.parse(raw);
-    } catch {
-      try {
-        return JSON.parse(repairJsonString(raw));
-      } catch {
-        return null;
-      }
-    }
-  };
-  const current_state = tryParseJson(currentStateMatch[1].trim()) as Record<string, unknown> | null;
-  const actionRaw = tryParseJson(actionMatch[1].trim());
-  const action = Array.isArray(actionRaw) ? actionRaw : actionRaw != null ? [actionRaw] : [];
-  if (!current_state || typeof current_state !== 'object') {
-    return null;
-  }
-  return { current_state, action };
-}
-
-/**
  * Extract JSON from model output, handling both plain JSON and code-block-wrapped JSON.
  * @param content - The string content that potentially contains JSON.
+ * @param options - Extraction options
+ * @param options.skipPlanTags - If true, skip extraction from <plan> tags (for Navigator agent)
+ * @param options.requiredKeys - Array of keys that must be present in the extracted JSON for validation
  * @returns Parsed JSON object
  * @throws Error if JSON parsing fails
  */
-export function extractJsonFromModelOutput(content: string): Record<string, unknown> {
+export function extractJsonFromModelOutput(
+  content: string,
+  options?: { skipPlanTags?: boolean; requiredKeys?: string[] },
+): Record<string, unknown> {
+  const skipPlanTags = options?.skipPlanTags ?? false;
+  const requiredKeys = options?.requiredKeys ?? [];
   try {
     let processedContent = content;
 
@@ -152,111 +123,206 @@ export function extractJsonFromModelOutput(content: string): Record<string, unkn
       throw new Error('Python tag structure does not contain valid parameters');
     }
 
-    // Handle GLM-style <tool_call>AgentOutput<arg_key>...</arg_key><arg_value>...</arg_value></tool_call>
-    if (processedContent.includes('<tool_call>AgentOutput') || processedContent.includes('<tool_call>')) {
-      const extracted = extractAgentOutputFromToolCall(processedContent);
-      if (extracted) {
-        return extracted as Record<string, unknown>;
-      }
-    }
-
-    // If content is wrapped in code blocks, extract the JSON block (e.g. ```json\n{...}\n```)
-    if (processedContent.includes('```')) {
-      // Prefer: first block that looks like ```json or ``` followed by optional lang then newline and content to next ```
-      const codeBlockMatch = processedContent.match(/```(?:json)?\s*\n([\s\S]*?)```/i);
-      if (codeBlockMatch?.[1]) {
-        const blockContent = codeBlockMatch[1].trim();
-        // Remove language identifier if still present at start (e.g. 'json\n', 'JSON ')
-        processedContent = blockContent.replace(/^\s*json\s*/i, '').trim();
-      } else {
-        // Fallback: split by ``` and take first non-empty block after optional "json"
-        const parts = processedContent.split('```');
-        const blockContent = parts[1]?.trim();
-        if (blockContent) {
-          processedContent = blockContent.replace(/^\s*json\s*/i, '').trim();
+    // Handle 智谱 GLM tool_call format: <tool_call>AgentOutput<arg_key>current_state</arg_key><arg_value>JSON</arg_value><arg_key>action</arg_key><arg_value>JSON</arg_value></tool_call>
+    if (processedContent.includes('<tool_call>') && processedContent.includes('<arg_key>')) {
+      const result: Record<string, unknown> = {};
+      // Allow arbitrary whitespace/newlines between arg_key and arg_value blocks
+      const regex = /<arg_key>([^<]+)<\/arg_key>\s*<arg_value>([\s\S]*?)<\/arg_value>/g;
+      let match;
+      while ((match = regex.exec(processedContent)) !== null) {
+        let key = match[1].trim();
+        // 某些 GLM 输出会把 key 连同后面的 `": { ...` 一起放进 <arg_key> 里，例如：
+        // <arg_key>current_state": {"evaluation_previous_goal": "..."}</arg_key>
+        // 这里做一次宽松清洗，只保留类似 current_state / action 这样的字段名，
+        // 避免后续 zod 校验时因为 key 不匹配而失败。
+        const separators = ['":', '": {', '":{', ':', ' {', '{'];
+        for (const sep of separators) {
+          const idx = key.indexOf(sep);
+          if (idx !== -1) {
+            key = key.slice(0, idx).trim();
+            break;
+          }
         }
-      }
-    }
 
-    // Helper to parse with optional repair for malformed JSON (e.g. unescaped quotes in strings)
-    const tryParse = (raw: string): Record<string, unknown> => {
-      try {
-        return JSON.parse(raw) as Record<string, unknown>;
-      } catch {
+        const valueStr = match[2].trim();
         try {
-          return JSON.parse(repairJsonString(raw)) as Record<string, unknown>;
+          result[key] = JSON.parse(valueStr);
         } catch {
-          throw new Error('JSON parse failed');
+          result[key] = valueStr;
         }
       }
-    };
+      if (Object.keys(result).length > 0) {
+        return result;
+      }
 
-    // First, try to parse the cleaned content directly
-    try {
-      return tryParse(processedContent);
-    } catch {
-      // If direct parsing fails (e.g. model returns natural language + JSON),
-      // try to heuristically extract the first JSON object block.
-      const firstBrace = processedContent.indexOf('{');
-      const lastBrace = processedContent.lastIndexOf('}');
-
-      if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
-        const jsonCandidate = processedContent.slice(firstBrace, lastBrace + 1);
-        try {
-          return tryParse(jsonCandidate);
-        } catch (parseError) {
-          // If the extracted block still fails, try to find nested JSON blocks
-          // by counting braces to find the matching closing brace
+      // Fallback: Handle malformed format where entire JSON is inside <arg_key> tag
+      // Example: <tool_call>AgentOutput<arg_key>current_state": {...}, "action": [...]</arg_key><arg_value></arg_value></tool_call>
+      const malformedArgKeyMatch = processedContent.match(/<arg_key>([\s\S]*?)<\/arg_key>/);
+      if (malformedArgKeyMatch) {
+        const argKeyContent = malformedArgKeyMatch[1].trim();
+        // Try to find and extract JSON object from the arg_key content
+        // The JSON might start with a key name like "current_state": {...} or directly with {
+        let jsonStart = argKeyContent.indexOf('{');
+        if (jsonStart === -1) {
+          // If no { found, try to find where JSON might start after a key name
+          // Look for pattern like "key": { or key": {
+          const colonBraceMatch = argKeyContent.match(/["\w]+\s*":\s*{/);
+          if (colonBraceMatch && colonBraceMatch.index !== undefined) {
+            jsonStart = argKeyContent.indexOf('{', colonBraceMatch.index);
+          }
+        }
+        if (jsonStart !== -1) {
+          // Find the matching closing brace by counting braces
           let braceCount = 0;
-          let endIndex = firstBrace;
-          for (let i = firstBrace; i < processedContent.length; i++) {
-            if (processedContent[i] === '{') braceCount++;
-            if (processedContent[i] === '}') braceCount--;
-            if (braceCount === 0) {
-              endIndex = i;
-              break;
+          let jsonEnd = -1;
+          for (let i = jsonStart; i < argKeyContent.length; i++) {
+            if (argKeyContent[i] === '{') braceCount++;
+            if (argKeyContent[i] === '}') {
+              braceCount--;
+              if (braceCount === 0) {
+                jsonEnd = i;
+                break;
+              }
             }
           }
-          if (endIndex > firstBrace) {
-            const nestedJsonCandidate = processedContent.slice(firstBrace, endIndex + 1);
-            return tryParse(nestedJsonCandidate);
-          }
-          throw parseError;
-        }
-      }
-
-      // As a secondary fallback, attempt to extract an array JSON block
-      const firstBracket = processedContent.indexOf('[');
-      const lastBracket = processedContent.lastIndexOf(']');
-      if (firstBracket !== -1 && lastBracket !== -1 && lastBracket > firstBracket) {
-        const jsonArrayCandidate = processedContent.slice(firstBracket, lastBracket + 1);
-        try {
-          return tryParse(jsonArrayCandidate);
-        } catch {
-          // Try nested bracket matching similar to braces
-          let bracketCount = 0;
-          let endIndex = firstBracket;
-          for (let i = firstBracket; i < processedContent.length; i++) {
-            if (processedContent[i] === '[') bracketCount++;
-            if (processedContent[i] === ']') bracketCount--;
-            if (bracketCount === 0) {
-              endIndex = i;
-              break;
+          if (jsonEnd !== -1 && jsonEnd > jsonStart) {
+            const jsonText = argKeyContent.slice(jsonStart, jsonEnd + 1).trim();
+            try {
+              return JSON.parse(jsonText) as Record<string, unknown>;
+            } catch {
+              // If parsing fails, try wrapping it in braces if it looks like object content
+              // e.g., "current_state": {...}, "action": [...] -> {"current_state": {...}, "action": [...]}
+              if (jsonText.trim().startsWith('"') || jsonText.includes('":')) {
+                try {
+                  const wrappedJson = `{${jsonText}}`;
+                  return JSON.parse(wrappedJson) as Record<string, unknown>;
+                } catch {
+                  // Continue to next fallback
+                }
+              }
             }
-          }
-          if (endIndex > firstBracket) {
-            const nestedArrayCandidate = processedContent.slice(firstBracket, endIndex + 1);
-            return tryParse(nestedArrayCandidate);
           }
         }
       }
     }
 
-    // If all attempts fail, throw a structured parse error with content preview for debugging
-    const contentPreview = content.length > 200 ? content.slice(0, 200) + '...' : content;
-    throw new ResponseParseError(
-      `Could not manually extract JSON from model output. Content preview: ${contentPreview}`,
-    );
+    // Fallback: malformed <tool_call> output (e.g. missing proper <arg_key>/<arg_value> tags).
+    // Try to extract the first JSON object from inside <tool_call>...</tool_call>.
+    if (processedContent.includes('<tool_call>') && processedContent.includes('</tool_call>')) {
+      const inner = processedContent
+        .replace(/^[\s\S]*?<tool_call>/, '')
+        .replace(/<\/tool_call>[\s\S]*$/, '')
+        .trim();
+      
+      // Remove any text before the first { (e.g., "AgentOutput" or tag names)
+      const jsonStart = inner.indexOf('{');
+      if (jsonStart !== -1) {
+        // Try to find the matching closing brace by counting
+        let braceCount = 0;
+        let jsonEnd = -1;
+        for (let i = jsonStart; i < inner.length; i++) {
+          if (inner[i] === '{') braceCount++;
+          if (inner[i] === '}') {
+            braceCount--;
+            if (braceCount === 0) {
+              jsonEnd = i;
+              break;
+            }
+          }
+        }
+        if (jsonEnd !== -1 && jsonEnd > jsonStart) {
+          const jsonText = inner.slice(jsonStart, jsonEnd + 1).trim();
+          try {
+            return JSON.parse(jsonText) as Record<string, unknown>;
+          } catch {
+            // If parsing fails, try to extract content that looks like JSON object properties
+            // e.g., "key": {...}, "key2": [...] -> {"key": {...}, "key2": [...]}
+            const trimmed = jsonText.trim();
+            if ((trimmed.startsWith('"') || trimmed.match(/^\w+":/)) && trimmed.includes('":')) {
+              try {
+                const wrappedJson = `{${trimmed}}`;
+                return JSON.parse(wrappedJson) as Record<string, unknown>;
+              } catch {
+                // Continue to next fallback
+              }
+            }
+          }
+        }
+      }
+      
+      // Last resort: try to find any JSON-like structure
+      const jsonStartAlt = inner.indexOf('{');
+      const jsonEndAlt = inner.lastIndexOf('}');
+      if (jsonStartAlt !== -1 && jsonEndAlt !== -1 && jsonEndAlt > jsonStartAlt) {
+        const jsonText = inner.slice(jsonStartAlt, jsonEndAlt + 1).trim();
+        try {
+          return JSON.parse(jsonText) as Record<string, unknown>;
+        } catch {
+          // Ignore and continue to next fallback
+        }
+      }
+    }
+
+    // Handle <plan>JSON</plan> format (e.g. 智谱 GLM Planner output)
+    // Skip this for Navigator agent to avoid extracting wrong format
+    if (!skipPlanTags) {
+      const planMatch = processedContent.match(/<plan>([\s\S]*?)<\/plan>/);
+      if (planMatch) {
+        const planContent = planMatch[1].trim();
+        if (planContent) {
+          const parsed = JSON.parse(planContent) as Record<string, unknown>;
+          // If requiredKeys are specified, check if this plan JSON has them
+          // If not, continue to next extraction method
+          if (requiredKeys.length === 0 || requiredKeys.every(key => key in parsed)) {
+            return parsed;
+          }
+        }
+      }
+    }
+
+    // If content is wrapped in code blocks (e.g. 智谱 GLM returns ```json\n{...}\n```), extract the JSON part
+    if (processedContent.includes('```')) {
+      const parts = processedContent.split('```');
+      // Use first code block content; if multiple, prefer the segment that looks like json
+      let block = parts[1];
+      if (block === undefined || !block.trim()) {
+        block = parts.find(p => p?.trim().startsWith('json') || p?.trim().startsWith('{')) ?? '';
+      }
+      processedContent = block;
+
+      // Remove language identifier if present (e.g., 'json\n' or 'json ')
+      const trimmed = processedContent.trim();
+      if (trimmed.startsWith('json')) {
+        processedContent = trimmed.slice(4).trim();
+      } else {
+        processedContent = trimmed;
+      }
+    }
+
+    // Try to extract the first JSON object from the content as a generic fallback
+    const firstBrace = processedContent.indexOf('{');
+    const lastBrace = processedContent.lastIndexOf('}');
+    if (firstBrace !== -1 && lastBrace > firstBrace) {
+      const candidate = processedContent.slice(firstBrace, lastBrace + 1).trim();
+      try {
+        const parsed = JSON.parse(candidate) as Record<string, unknown>;
+        // If requiredKeys are specified, validate the extracted JSON has them
+        if (requiredKeys.length === 0 || requiredKeys.every(key => key in parsed)) {
+          return parsed;
+        }
+        // If validation fails, continue to try direct parse
+      } catch {
+        // ignore and fall through
+      }
+    }
+
+    // Parse the cleaned content directly
+    const directParsed = JSON.parse(processedContent) as Record<string, unknown>;
+    // Final validation if requiredKeys are specified
+    if (requiredKeys.length > 0 && !requiredKeys.every(key => key in directParsed)) {
+      throw new Error(`Extracted JSON missing required keys: ${requiredKeys.filter(k => !(k in directParsed)).join(', ')}`);
+    }
+    return directParsed;
   } catch (e) {
     throw new ResponseParseError(`Could not manually extract JSON from model output`);
   }

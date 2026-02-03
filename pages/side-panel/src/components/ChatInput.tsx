@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
-// import { FaMicrophone } from 'react-icons/fa';
-// import { AiOutlineLoading3Quarters } from 'react-icons/ai';
+import { FaMicrophone } from 'react-icons/fa';
+import { AiOutlineLoading3Quarters } from 'react-icons/ai';
 import { t } from '@extension/i18n';
 
 interface ChatInputProps {
@@ -28,9 +28,9 @@ interface AttachedFile {
 export default function ChatInput({
   onSendMessage,
   onStopTask,
-  // onMicClick,
-  // isRecording = false,
-  // isProcessingSpeech = false,
+  onMicClick,
+  isRecording = false,
+  isProcessingSpeech = false,
   disabled,
   showStopButton,
   setContent,
@@ -45,7 +45,7 @@ export default function ChatInput({
     [disabled, text, attachedFiles],
   );
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  // const fileInputRef = useRef<HTMLInputElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Handle text changes and resize textarea
   const handleTextChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
@@ -129,54 +129,54 @@ export default function ChatInput({
     }
   }, [historicalSessionId, onReplay]);
 
-  // const handleFileSelect = useCallback(() => {
-  //   fileInputRef.current?.click();
-  // }, []);
+  const handleFileSelect = useCallback(() => {
+    fileInputRef.current?.click();
+  }, []);
 
-  // const handleFileChange = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
-  //   const files = e.target.files;
-  //   if (!files || files.length === 0) return;
+  const handleFileChange = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
 
-  //   const newFiles: AttachedFile[] = [];
-  //   const allowedTypes = ['.txt', '.md', '.markdown', '.json', '.csv', '.log', '.xml', '.yaml', '.yml'];
+    const newFiles: AttachedFile[] = [];
+    const allowedTypes = ['.txt', '.md', '.markdown', '.json', '.csv', '.log', '.xml', '.yaml', '.yml'];
 
-  //   for (let i = 0; i < files.length; i++) {
-  //     const file = files[i];
-  //     const fileExt = '.' + file.name.split('.').pop()?.toLowerCase();
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      const fileExt = '.' + file.name.split('.').pop()?.toLowerCase();
 
-  //     // Check if file type is allowed
-  //     if (!allowedTypes.includes(fileExt)) {
-  //       console.warn(`File type ${fileExt} not supported. Only text-based files are allowed.`);
-  //       continue;
-  //     }
+      // Check if file type is allowed
+      if (!allowedTypes.includes(fileExt)) {
+        console.warn(`File type ${fileExt} not supported. Only text-based files are allowed.`);
+        continue;
+      }
 
-  //     // Check file size (limit to 1MB)
-  //     if (file.size > 1024 * 1024) {
-  //       console.warn(`File ${file.name} is too large. Maximum size is 1MB.`);
-  //       continue;
-  //     }
+      // Check file size (limit to 1MB)
+      if (file.size > 1024 * 1024) {
+        console.warn(`File ${file.name} is too large. Maximum size is 1MB.`);
+        continue;
+      }
 
-  //     try {
-  //       const content = await file.text();
-  //       newFiles.push({
-  //         name: file.name,
-  //         content,
-  //         type: file.type || 'text/plain',
-  //       });
-  //     } catch (error) {
-  //       console.error(`Error reading file ${file.name}:`, error);
-  //     }
-  //   }
+      try {
+        const content = await file.text();
+        newFiles.push({
+          name: file.name,
+          content,
+          type: file.type || 'text/plain',
+        });
+      } catch (error) {
+        console.error(`Error reading file ${file.name}:`, error);
+      }
+    }
 
-  //   if (newFiles.length > 0) {
-  //     setAttachedFiles(prev => [...prev, ...newFiles]);
-  //   }
+    if (newFiles.length > 0) {
+      setAttachedFiles(prev => [...prev, ...newFiles]);
+    }
 
-  //   // Reset file input
-  //   if (fileInputRef.current) {
-  //     fileInputRef.current.value = '';
-  //   }
-  // }, []);
+    // Reset file input
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+    }
+  }, []);
 
   const handleRemoveFile = useCallback((index: number) => {
     setAttachedFiles(prev => prev.filter((_, i) => i !== index));
@@ -243,7 +243,7 @@ export default function ChatInput({
           }`}>
           <div className="flex gap-2 text-gray-500">
             {/* File attachment button */}
-            {/* <button
+            <button
               type="button"
               onClick={handleFileSelect}
               disabled={disabled}
@@ -257,10 +257,10 @@ export default function ChatInput({
                     : 'text-gray-500 hover:bg-gray-100 hover:text-gray-700'
               }`}>
               <span className="text-lg">📎</span>
-            </button> */}
+            </button>
 
             {/* Hidden file input */}
-            {/* <input
+            <input
               ref={fileInputRef}
               type="file"
               multiple
@@ -297,7 +297,7 @@ export default function ChatInput({
                   <FaMicrophone className={`size-4 ${isRecording ? 'animate-pulse' : ''}`} />
                 )}
               </button>
-            )} */}
+            )}
           </div>
 
           {showStopButton ? (

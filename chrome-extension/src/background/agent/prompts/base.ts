@@ -61,16 +61,6 @@ abstract class BasePrompt {
           actionResultsDescription += `\nAction error ${i + 1}/${context.actionResults.length}: ...${error}`;
         }
       }
-      const lastResult = context.actionResults[context.actionResults.length - 1];
-      if (lastResult?.isDone) {
-        actionResultsDescription +=
-          '\n[System: Navigator has executed the "done" action indicating task completion. Set done=true and provide a concise final_answer.]';
-      }
-    }
-    if (context.repeatedStepHint) {
-      actionResultsDescription +=
-        '\n[System: The same step has been executed multiple times without the task being marked complete. If the user goal (e.g. download) has been achieved, set done=true and provide a concise final_answer. Do not suggest the same step again.]';
-      context.repeatedStepHint = false;
     }
 
     const currentTab = `{id: ${browserState.tabId}, url: ${browserState.url}, title: ${browserState.title}}`;

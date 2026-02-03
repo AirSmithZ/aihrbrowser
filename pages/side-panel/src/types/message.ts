@@ -1,37 +1,37 @@
 export const ACTOR_PROFILES = {
   user: {
-    name: 'You',
-    emoji: '🧑‍💻',
-    iconBackground: '#22c55e',
+    name: 'User',
+    icon: 'icons/user.svg',
+    iconBackground: '#4CAF50',
   },
   system: {
-    name: 'AIHR System',
-    emoji: '🧠',
-    iconBackground: '#0ea5e9',
+    name: 'System',
+    icon: 'icons/system.svg',
+    iconBackground: '#2196F3',
   },
   planner: {
     name: 'Planner',
-    emoji: '🗺️',
-    iconBackground: '#f97316',
+    icon: 'icons/planner.svg',
+    iconBackground: '#FF9800',
   },
   navigator: {
     name: 'Navigator',
-    emoji: '🧭',
-    iconBackground: '#38bdf8',
+    icon: 'icons/navigator.svg',
+    iconBackground: '#40A9FF',
   },
   validator: {
     name: 'Validator',
-    emoji: '✅',
-    iconBackground: '#ec4899',
+    icon: 'icons/validator.svg',
+    iconBackground: '#EC407A',
   },
   manager: {
     name: 'Manager',
-    emoji: '📌',
-    iconBackground: '#a855f7',
+    icon: 'icons/manager.svg',
+    iconBackground: '#9C27B0',
   },
   evaluator: {
     name: 'Evaluator',
-    emoji: '📊',
+    icon: 'icons/evaluator.svg',
     iconBackground: '#795548',
   },
 } as const;

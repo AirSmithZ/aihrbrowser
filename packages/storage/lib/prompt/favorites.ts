@@ -18,6 +18,11 @@ const defaultFavoritePrompts = [
     content:
       "打开https://www.1ppt.com/，搜索下载一篇关于艺术设计的ppt",
   },
+  {
+    title: '📃 下载简历模板',
+    content:
+      "打开http://www.51jianli-moban.com/，搜索前端开发，下载2篇简历",
+  },
 ];
 
 // Define the favorite prompt type

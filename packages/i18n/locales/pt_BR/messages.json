@@ -1,11 +1,11 @@
 {
   "app_metadata_description": {
     "description": "Descrição da extensão",
-    "message": "Automatize tarefas da web com IA! AIHR é uma extensão de código aberto para o navegador que permite extrair dados, preencher formulários e muito mais."
+    "message": "Automatize tarefas da web com IA! NanoBrowser é uma extensão de código aberto para o navegador que permite extrair dados, preencher formulários e muito mais."
   },
   "app_metadata_name": {
     "description": "Nome da extensão",
-    "message": "AIHR: Agente Web de IA e Automação"
+    "message": "AutoBrowser: Agente Web de IA e Automação"
   },
   "errors_unknown": {
     "message": "Ocorreu um erro desconhecido"
@@ -38,7 +38,7 @@
     "message": "Voltar para o chat"
   },
   "welcome_title": {
-    "message": "Bem-vindo ao AIHR!"
+    "message": "Bem-vindo ao AutoBrowser!"
   },
   "welcome_instruction": {
     "message": "Para começar, por favor, configure suas chaves de API na página de configurações."
@@ -167,7 +167,7 @@
     "message": "Ativar Entrada de Voz"
   },
   "permissions_microphone_description": {
-    "message": "O AIHR precisa de acesso ao microfone para converter sua fala em texto."
+    "message": "O AutoBrowser precisa de acesso ao microfone para converter sua fala em texto."
   },
   "permissions_microphone_grantButton": {
     "message": "Conceder Permissão ao Microfone"
@@ -510,9 +510,6 @@
   },
   "exec_errors_maxFailuresReached": {
     "message": "Máximo de falhas atingido"
-  },
-  "exec_errors_serviceUnavailable": {
-    "message": "Serviço da API temporariamente indisponível (503). Tente novamente em alguns minutos."
   },
   "exec_task_cancel": {
     "message": "Tarefa cancelada"

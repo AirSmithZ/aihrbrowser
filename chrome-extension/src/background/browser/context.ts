@@ -4,9 +4,12 @@ import {
   type BrowserState,
   DEFAULT_BROWSER_CONTEXT_CONFIG,
   type TabInfo,
+  URLNotAllowedError,
 } from './views';
 import Page, { build_initial_state } from './page';
 import { createLogger } from '@src/background/log';
+import { isUrlAllowed } from './util';
+import { analytics } from '../services/analytics';
 
 const logger = createLogger('BrowserContext');
 export default class BrowserContext {
@@ -133,12 +136,6 @@ export default class BrowserContext {
     return new Set(tabs.map(tab => tab.id).filter(id => id !== undefined));
   }
 
-  /** Default timeout for tab operations (e.g. switch). */
-  private static readonly TAB_OPERATION_TIMEOUT_MS = 5000;
-
-  /** Timeout for navigation (openTab / navigateTo); longer to allow slow pages to load. */
-  private static readonly TAB_NAVIGATION_TIMEOUT_MS = 20000;
-
   /**
    * Wait for tab events to occur after a tab is created or updated.
    * @param tabId - The ID of the tab to wait for events on.
@@ -153,8 +150,11 @@ export default class BrowserContext {
       timeoutMs?: number;
     } = {},
   ): Promise<void> {
-    const { waitForUpdate = true, waitForActivation = true, timeoutMs = BrowserContext.TAB_OPERATION_TIMEOUT_MS } =
-      options;
+    const {
+      waitForUpdate = true,
+      waitForActivation = true,
+      timeoutMs = this._config.tabOperationTimeoutMs ?? 15000,
+    } = options;
 
     const promises: Promise<void>[] = [];
 
@@ -235,6 +235,13 @@ export default class BrowserContext {
   }
 
   public async navigateTo(url: string): Promise<void> {
+    if (!isUrlAllowed(url, this._config.allowedUrls, this._config.deniedUrls)) {
+      throw new URLNotAllowedError(`URL: ${url} is not allowed`);
+    }
+
+    // Track domain visit for analytics
+    void analytics.trackDomainVisit(url);
+
     const page = await this.getCurrentPage();
     if (!page) {
       await this.openTab(url);
@@ -247,9 +254,9 @@ export default class BrowserContext {
     }
     //  Use chrome.tabs.update only if the page is not attached
     const tabId = page.tabId;
-    // Update tab and wait for events (longer timeout for navigation so slow pages can load)
+    // Update tab and wait for events
     await chrome.tabs.update(tabId, { url, active: true });
-    await this.waitForTabEvents(tabId, { timeoutMs: BrowserContext.TAB_NAVIGATION_TIMEOUT_MS });
+    await this.waitForTabEvents(tabId);
 
     // Reattach the page after navigation completes
     const updatedPage = await this._getOrCreatePage(await chrome.tabs.get(tabId), true);
@@ -258,13 +265,17 @@ export default class BrowserContext {
   }
 
   public async openTab(url: string): Promise<Page> {
+    if (!isUrlAllowed(url, this._config.allowedUrls, this._config.deniedUrls)) {
+      throw new URLNotAllowedError(`Open tab failed. URL: ${url} is not allowed`);
+    }
+
     // Create the new tab
     const tab = await chrome.tabs.create({ url, active: true });
     if (!tab.id) {
       throw new Error('No tab ID available');
     }
-    // Wait for tab events (longer timeout so slow pages like 1ppt.com can load)
-    await this.waitForTabEvents(tab.id, { timeoutMs: BrowserContext.TAB_NAVIGATION_TIMEOUT_MS });
+    // Wait for tab events
+    await this.waitForTabEvents(tab.id);
 
     // Get updated tab information
     const updatedTab = await chrome.tabs.get(tab.id);

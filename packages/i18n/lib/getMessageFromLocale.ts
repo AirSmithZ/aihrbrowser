@@ -4,6 +4,7 @@
  */
 import enMessage from '../locales/en/messages.json';
 import pt_BRMessage from '../locales/pt_BR/messages.json';
+import zh_CNMessage from '../locales/zh_CN/messages.json';
 import zh_TWMessage from '../locales/zh_TW/messages.json';
 
 export function getMessageFromLocale(locale: string) {
@@ -12,6 +13,8 @@ export function getMessageFromLocale(locale: string) {
       return enMessage;
     case 'pt_BR':
       return pt_BRMessage;
+    case 'zh_CN':
+      return zh_CNMessage;
     case 'zh_TW':
       return zh_TWMessage;
     default:
@@ -20,7 +23,7 @@ export function getMessageFromLocale(locale: string) {
 }
 
 export const defaultLocale = (() => {
-  const locales = ['en', 'pt_BR', 'zh_TW'];
+  const locales = ['en', 'pt_BR', 'zh_CN', 'zh_TW'];
   const firstLocale = locales[0];
   const defaultLocale = Intl.DateTimeFormat().resolvedOptions().locale.replace('-', '_');
   if (locales.includes(defaultLocale)) {

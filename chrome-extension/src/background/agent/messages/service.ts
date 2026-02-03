@@ -437,4 +437,11 @@ export default class MessageManager {
     const msg = new ToolMessage({ content, tool_call_id: String(id) });
     this.addMessageWithTokens(msg, messageType);
   }
+
+  /**
+   * Get total tokens in message history
+   */
+  getTotalTokens(): number {
+    return this.history.getTotalTokens();
+  }
 }

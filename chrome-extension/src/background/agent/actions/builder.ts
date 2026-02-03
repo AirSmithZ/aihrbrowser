@@ -244,23 +244,99 @@ export class ActionBuilder {
         }
 
         try {
+          // === 下载检测入口（针对点击触发的下载）===
+          // 这里是整个下载链路的起点：Navigator 捕捉到需要点击的元素，
+          // 在真正点击前，先启动 DownloadManager 的监听，避免漏掉非常快的下载任务。
+          // Record current tab info before clicking
+          const currentPageBeforeClick = await this.context.browserContext.getCurrentPage();
+          const currentTabIdBeforeClick = currentPageBeforeClick.tabId;
+          const clickStartMs = Date.now();
           const initialTabIds = await this.context.browserContext.getAllTabIds();
+          // 这里不要长时间等待 downloadId，否则在“没有下载”的大多数点击场景会白白阻塞。
+          // 延迟触发的下载由 Executor 中的 fallback（最近 10s 下载接管）兜底。
+          const downloadDetectionTimeoutMs = 1200;
+          // Start listening for a new download BEFORE the click (to avoid missing very fast downloads)
+          const waitDownloadPromise =
+            !this.context.downloadState?.inProgress && this.context.downloadManager
+              ? this.context.downloadManager.waitForNewDownload({
+                  sinceMs: clickStartMs,
+                  tabId: currentTabIdBeforeClick,
+                  // 短等待：优先不阻塞当前 action；延迟下载由 Executor fallback 处理
+                  timeoutMs: downloadDetectionTimeoutMs,
+                  pollIntervalMs: 300,
+                })
+              : Promise.resolve(null);
+          logger.info(
+            '[Navigator/clickElement] 开始监听下载任务',
+            JSON.stringify({ sinceMs: clickStartMs, tabId: currentTabIdBeforeClick }),
+          );
+
           await page.clickElementNode(this.context.options.useVision, elementNode);
           let msg = t('act_click_ok', [input.index.toString(), elementNode.getAllTextTillNextClickableElement(2)]);
           logger.info(msg);
 
-          // TODO: could be optimized by chrome extension tab api
+          // Wait a bit for new tab to open and activate (browser usually auto-activates new tabs)
+          await new Promise(resolve => setTimeout(resolve, 500));
+
+          // Check if a new tab was opened
           const currentTabIds = await this.context.browserContext.getAllTabIds();
           if (currentTabIds.size > initialTabIds.size) {
             const newTabMsg = t('act_click_newTabOpened');
             msg += ` - ${newTabMsg}`;
             logger.info(newTabMsg);
-            // find the tab id that is not in the initial tab ids
-            const newTabId = Array.from(currentTabIds).find(id => !initialTabIds.has(id));
-            if (newTabId) {
-              await this.context.browserContext.switchTab(newTabId);
+
+            // First, check the currently active tab - browser usually auto-activates new tabs
+            const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+            if (activeTab?.id && !initialTabIds.has(activeTab.id)) {
+              // Current active tab is the new one, update context and use it
+              logger.info(`New tab is already active: ${activeTab.id}, updating context`);
+              await this.context.browserContext.switchTab(activeTab.id);
+            } else {
+              // New tab is not active, find it by comparing tab IDs
+              // Get all tabs sorted by creation time (newest first) to find the latest
+              const allTabs = await chrome.tabs.query({ currentWindow: true });
+              const newTabs = allTabs.filter(tab => tab.id && !initialTabIds.has(tab.id));
+              
+              if (newTabs.length > 0) {
+                // Sort by index (higher index = newer tab) or use the first one found
+                const newTab = newTabs.sort((a, b) => (b.index ?? 0) - (a.index ?? 0))[0];
+                if (newTab.id) {
+                  logger.info(`Found new tab ${newTab.id} (not active), switching to it`);
+                  await this.context.browserContext.switchTab(newTab.id);
+                }
+              } else {
+                logger.warning('New tab detected but could not find it in tab list');
+              }
+            }
+          } else {
+            // No new tab opened, but check if we're still on the same tab
+            // If URL changed significantly, we might have navigated
+            const currentPageAfterClick = await this.context.browserContext.getCurrentPage();
+            if (currentPageAfterClick.tabId !== currentTabIdBeforeClick) {
+              // Tab changed even though count didn't increase (maybe tab was reused)
+              logger.info(`Tab changed from ${currentTabIdBeforeClick} to ${currentPageAfterClick.tabId}`);
             }
           }
+
+          // Detect download ID (event-driven). If found, lock executor until completion.
+          // 只有在真正检测到下载任务时才设置下载状态，没有downloadId直接跳过
+          const downloadId = await waitDownloadPromise;
+          logger.info('[Navigator/clickElement] waitForNewDownload 结束，downloadId =', downloadId);
+          if (downloadId && this.context.downloadManager) {
+            // 真正执行下载任务时，才设置下载状态
+            this.context.downloadState = {
+              inProgress: true,
+              downloadId,
+              startedAtMs: Date.now(),
+            };
+            const startMsg = `Download detected (id=${downloadId}). Waiting for completion...`;
+            this.context.emitEvent(Actors.NAVIGATOR, ExecutionState.ACT_START, startMsg);
+            msg += ` - ${startMsg}`;
+          } else {
+            // 没有检测到下载任务，直接跳过下载逻辑
+            logger.info('[Navigator/clickElement] 未检测到下载任务，跳过下载逻辑');
+          }
+
           this.context.emitEvent(Actors.NAVIGATOR, ExecutionState.ACT_OK, msg);
           return new ActionResult({ extractedContent: msg, includeInMemory: true });
         } catch (error) {

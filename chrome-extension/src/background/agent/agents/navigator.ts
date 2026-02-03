@@ -1,18 +1,16 @@
 import { z } from 'zod';
 import { BaseAgent, type BaseAgentOptions, type ExtraAgentOptions } from './base';
 import { createLogger } from '@src/background/log';
-import { ActionResult, type AgentOutput } from '../types';
+import { ActionResult, type AgentOutput, StepMetadata } from '../types';
 import type { Action } from '../actions/builder';
 import { buildDynamicActionSchema } from '../actions/builder';
 import { agentBrainSchema } from '../types';
 import { type BaseMessage, HumanMessage } from '@langchain/core/messages';
 import { Actors, ExecutionState } from '../event/types';
-import { t } from '@extension/i18n';
 import {
   ChatModelAuthError,
   ChatModelBadRequestError,
   ChatModelForbiddenError,
-  ChatModelServiceUnavailableError,
   EXTENSION_CONFLICT_ERROR_MESSAGE,
   ExtensionConflictError,
   isAbortedError,
@@ -20,15 +18,12 @@ import {
   isBadRequestError,
   isExtensionConflictError,
   isForbiddenError,
-  isServiceUnavailableError,
   ResponseParseError,
   LLM_FORBIDDEN_ERROR_MESSAGE,
   RequestCancelledError,
 } from './errors';
-import { extractUsage, logLLMUsage } from '../llm-usage-log';
-import { extractJsonFromModelOutput, removeThinkTags } from '../messages/utils';
 import { calcBranchPathHashSet } from '@src/background/browser/dom/views';
-import { type BrowserState, BrowserStateHistory } from '@src/background/browser/views';
+import { type BrowserState, BrowserStateHistory, URLNotAllowedError } from '@src/background/browser/views';
 import { convertZodToJsonSchema, repairJsonString } from '@src/background/utils';
 import { HistoryTreeProcessor } from '@src/background/browser/dom/history/service';
 import { AgentStepRecord } from '../history';
@@ -42,11 +37,6 @@ interface ParsedModelOutput {
   };
   action?: (Record<string, unknown> | null)[] | null;
 }
-
-/** Model may return these names; map to registered action names. */
-const ACTION_NAME_ALIASES: Record<string, string> = {
-  switch_to_tab: 'switch_tab',
-};
 
 export class NavigatorActionRegistry {
   private actions: Record<string, Action> = {};
@@ -66,8 +56,12 @@ export class NavigatorActionRegistry {
   }
 
   getAction(name: string): Action | undefined {
-    const resolved = ACTION_NAME_ALIASES[name] ?? name;
-    return this.actions[resolved];
+    return this.actions[name];
+  }
+
+  // Expose all registered action names so we can robustly recover actions
+  getActionNames(): string[] {
+    return Object.keys(this.actions);
   }
 
   setupModelOutputSchema(): z.ZodType {
@@ -102,8 +96,6 @@ export class NavigatorAgent extends BaseAgent<z.ZodType, NavigatorResult> {
   }
 
   async invoke(inputMessages: BaseMessage[]): Promise<this['ModelOutput']> {
-    const startMs = Date.now();
-
     // Use structured output
     if (this.withStructuredOutput) {
       const structuredLlm = this.chatLLM.withStructuredOutput(this.jsonSchema, {
@@ -118,10 +110,6 @@ export class NavigatorAgent extends BaseAgent<z.ZodType, NavigatorResult> {
           ...this.callOptions,
         });
 
-        const elapsedMs = Date.now() - startMs;
-        const usage = response?.raw ? extractUsage(response.raw) : null;
-        logLLMUsage(this.id, this.modelName, usage, elapsedMs);
-
         if (response.parsed) {
           return response.parsed;
         }
@@ -130,197 +118,40 @@ export class NavigatorAgent extends BaseAgent<z.ZodType, NavigatorResult> {
           throw error;
         }
 
-        // Try to extract JSON from raw response manually if possible
+        // Try to extract JSON from markdown code blocks if parsing failed
         const errorMessage = error instanceof Error ? error.message : String(error);
-        
-        if (response?.raw) {
-          // First try to parse from content string
-          if (response.raw.content && typeof response.raw.content === 'string') {
-            const parsed = this.manuallyParseResponse(response.raw.content);
-            if (parsed) {
-              logger.debug(`[${this.modelName}] Successfully parsed JSON from raw content after structured output failure`);
-              return parsed;
-            }
-          }
-          
-          // Also check for tool_calls in raw response (for Claude-style providers)
-          const rawMessage = response.raw as any;
-          if (rawMessage.tool_calls && Array.isArray(rawMessage.tool_calls) && rawMessage.tool_calls.length > 0) {
-            const firstToolCall = rawMessage.tool_calls[0];
-            
-            // Handle different tool_call structures
-            let parsedArgs: any = null;
-            
-            // Structure 1: LangChain processed format { name: string, args: object }
-            if (firstToolCall?.args && typeof firstToolCall.args === 'object' && !Array.isArray(firstToolCall.args)) {
-              parsedArgs = firstToolCall.args;
-            }
-            // Structure 2: OpenAI format { function: { name: string, arguments: string } }
-            else if (firstToolCall?.function?.arguments && typeof firstToolCall.function.arguments === 'string') {
-              try {
-                parsedArgs = JSON.parse(firstToolCall.function.arguments);
-              } catch (parseError) {
-                logger.warning(`[${this.modelName}] Failed to parse function.arguments:`, parseError);
-              }
-            }
-            
-            if (parsedArgs && typeof parsedArgs === 'object') {
-              // Fix: Handle double-escaped JSON strings (with repair + fallback for current_state)
-              if (parsedArgs.current_state && typeof parsedArgs.current_state === 'string') {
-                const raw = parsedArgs.current_state;
-                try {
-                  parsedArgs.current_state = JSON.parse(raw);
-                } catch {
-                  try {
-                    parsedArgs.current_state = JSON.parse(repairJsonString(raw));
-                  } catch {
-                    parsedArgs.current_state = {
-                      evaluation_previous_goal: '',
-                      memory: raw.slice(0, 2000),
-                      next_goal: '',
-                    };
-                  }
-                }
-              }
-              if (parsedArgs.action && typeof parsedArgs.action === 'string') {
-                const rawAction = parsedArgs.action;
-                try {
-                  parsedArgs.action = JSON.parse(rawAction);
-                } catch {
-                  try {
-                    parsedArgs.action = JSON.parse(repairJsonString(rawAction));
-                  } catch {
-                    // keep as-is
-                  }
-                }
-              }
-              
-              try {
-                const validated = this.validateModelOutput(parsedArgs);
-                if (validated) {
-                  logger.debug(`[${this.modelName}] Successfully parsed JSON from tool_calls arguments after structured output failure`);
-                  return validated;
-                }
-              } catch (parseError) {
-                logger.warning(`[${this.modelName}] Failed to validate tool_calls arguments:`, parseError);
-              }
-            }
+        if (
+          errorMessage.includes('is not valid JSON') &&
+          response?.raw?.content &&
+          typeof response.raw.content === 'string'
+        ) {
+          const parsed = this.manuallyParseResponse(response.raw.content);
+          if (parsed) {
+            return parsed;
           }
         }
-        
         throw new Error(`Failed to invoke ${this.modelName} with structured output: \n${errorMessage}`);
       }
 
       // Use type assertion to access the properties
       const rawResponse = response.raw as BaseMessage & {
         tool_calls?: Array<{
-          name?: string;
-          function?: {
-            name?: string;
-            arguments?: string;
+          args: {
+            currentState: typeof agentBrainSchema._type;
+            action: z.infer<ReturnType<typeof buildDynamicActionSchema>>;
           };
-          args?: any; // Can be object (LangChain processed) or string
-          arguments?: string;
-          type?: string;
-          id?: string;
         }>;
       };
 
       // sometimes LLM returns an empty content, but with one or more tool calls, so we need to check the tool calls
       if (rawResponse.tool_calls && rawResponse.tool_calls.length > 0) {
+        logger.info('Navigator structuredLlm tool call with empty content', rawResponse.tool_calls);
+        // only use the first tool call
         const toolCall = rawResponse.tool_calls[0];
-        logger.debug('Navigator found tool_calls in raw response:', JSON.stringify(toolCall, null, 2));
-        
-        let parsedArgs: any = null;
-        
-        // Handle LangChain's processed tool_calls format (args is already an object)
-        if (toolCall.args && typeof toolCall.args === 'object' && !Array.isArray(toolCall.args)) {
-          logger.info('Navigator: Found LangChain processed tool_call.args (object)');
-          parsedArgs = toolCall.args;
-        }
-        // Handle OpenAI-compatible tool_calls format (function.arguments is a JSON string)
-        else if (toolCall.function?.arguments && typeof toolCall.function.arguments === 'string') {
-          logger.info('Navigator: Found OpenAI format tool_call.function.arguments (string)');
-          try {
-            parsedArgs = JSON.parse(toolCall.function.arguments);
-          } catch (parseError) {
-            logger.warning('Navigator failed to parse tool_calls.function.arguments:', parseError);
-          }
-        }
-        // Handle args as string
-        else if (toolCall.args && typeof toolCall.args === 'string') {
-          logger.info('Navigator: Found tool_call.args (string)');
-          try {
-            parsedArgs = JSON.parse(toolCall.args);
-          } catch (parseError) {
-            logger.warning('Navigator failed to parse tool_call.args string:', parseError);
-          }
-        }
-        // Handle direct arguments field
-        else if (toolCall.arguments && typeof toolCall.arguments === 'string') {
-          logger.info('Navigator: Found tool_call.arguments (string)');
-          try {
-            parsedArgs = JSON.parse(toolCall.arguments);
-          } catch (parseError) {
-            logger.warning('Navigator failed to parse tool_call.arguments:', parseError);
-          }
-        }
-
-        if (parsedArgs && typeof parsedArgs === 'object') {
-          try {
-            // Fix: Handle double-escaped JSON strings in current_state field (repair + fallback)
-            if (parsedArgs.current_state && typeof parsedArgs.current_state === 'string') {
-              const raw = parsedArgs.current_state;
-              try {
-                logger.debug('Navigator: current_state is a string, parsing it as JSON');
-                parsedArgs.current_state = JSON.parse(raw);
-                logger.debug('Navigator: Successfully parsed current_state from string to object');
-              } catch (parseError) {
-                try {
-                  parsedArgs.current_state = JSON.parse(repairJsonString(raw));
-                  logger.debug('Navigator: Parsed current_state after repairJsonString');
-                } catch (repairError) {
-                  logger.warning('Navigator: Failed to parse current_state (parse + repair):', parseError);
-                  parsedArgs.current_state = {
-                    evaluation_previous_goal: '',
-                    memory: raw.slice(0, 2000),
-                    next_goal: '',
-                  };
-                }
-              }
-            }
-
-            // Fix: Handle action field that might be a JSON string instead of an array
-            if (parsedArgs.action && typeof parsedArgs.action === 'string') {
-              const rawAction = parsedArgs.action;
-              try {
-                logger.debug('Navigator: action is a string, parsing it as JSON');
-                parsedArgs.action = JSON.parse(rawAction);
-                logger.debug('Navigator: Successfully parsed action from string to array');
-              } catch (parseError) {
-                try {
-                  parsedArgs.action = JSON.parse(repairJsonString(rawAction));
-                  logger.debug('Navigator: Parsed action after repairJsonString');
-                } catch (repairError) {
-                  logger.warning('Navigator: Failed to parse action (parse + repair):', parseError);
-                }
-              }
-            }
-
-            const validated = this.validateModelOutput(parsedArgs);
-            if (validated) {
-              logger.info('Navigator successfully extracted and validated JSON from tool_calls');
-              return validated;
-            } else {
-              logger.warning('Navigator: validateModelOutput returned undefined');
-            }
-          } catch (validationError) {
-            logger.warning('Navigator failed to validate parsed tool_calls arguments:', validationError);
-            logger.warning('Navigator: Parsed args that failed validation:', JSON.stringify(parsedArgs, null, 2));
-          }
-        } else {
-          logger.warning('Navigator: tool_calls found but could not extract valid arguments. Tool call structure:', JSON.stringify(toolCall, null, 2));
-        }
+        return {
+          current_state: toolCall.args.currentState,
+          action: [...toolCall.args.action],
+        };
       }
       throw new ResponseParseError('Could not parse navigator response');
     }
@@ -338,6 +169,8 @@ export class NavigatorAgent extends BaseAgent<z.ZodType, NavigatorResult> {
     let modelOutputString: string | null = null;
     let browserStateHistory: BrowserStateHistory | null = null;
     let actionResults: ActionResult[] = [];
+    const stepStartTime = Date.now();
+    let inputTokens = 0;
 
     try {
       this.context.emitEvent(Actors.NAVIGATOR, ExecutionState.STEP_START, 'Navigating...');
@@ -354,18 +187,35 @@ export class NavigatorAgent extends BaseAgent<z.ZodType, NavigatorResult> {
         return agentOutput;
       }
 
+      // Get input token count before LLM call
+      inputTokens = messageManager.getTotalTokens();
+
       // call the model to get the actions to take
       const inputMessages = messageManager.getMessages();
       // logger.info('Navigator input message', inputMessages[inputMessages.length - 1]);
-
+      logger.debug('Navigator input messages', {
+        count: inputMessages.length,
+        inputTokens,
+      });
+      
+      const llmInvokeStartTime = Date.now();
       const modelOutput = await this.invoke(inputMessages);
+      const llmInvokeEndTime = Date.now();
+      
+      logger.debug('Navigator LLM invoke completed', {
+        durationMs: llmInvokeEndTime - llmInvokeStartTime,
+        usage: this.getLastLLMUsage(),
+      });
 
       // check if the task is paused or stopped
       if (this.context.paused || this.context.stopped) {
         cancelled = true;
         return agentOutput;
       }
-
+      logger.debug('Navigator model output', {
+        hasCurrentState: !!modelOutput.current_state,
+        actionCount: Array.isArray(modelOutput.action) ? modelOutput.action.length : 0,
+      });
       const actions = this.fixActions(modelOutput);
       modelOutput.action = actions;
       modelOutputString = JSON.stringify(modelOutput);
@@ -407,8 +257,8 @@ export class NavigatorAgent extends BaseAgent<z.ZodType, NavigatorResult> {
         throw new ExtensionConflictError(EXTENSION_CONFLICT_ERROR_MESSAGE, error);
       } else if (isForbiddenError(error)) {
         throw new ChatModelForbiddenError(LLM_FORBIDDEN_ERROR_MESSAGE, error);
-      } else if (isServiceUnavailableError(error)) {
-        throw new ChatModelServiceUnavailableError(t('exec_errors_serviceUnavailable'), error);
+      } else if (error instanceof URLNotAllowedError) {
+        throw error;
       }
 
       const errorString = `Navigation failed: ${errorMessage}`;
@@ -435,7 +285,36 @@ export class NavigatorAgent extends BaseAgent<z.ZodType, NavigatorResult> {
           });
         });
 
-        const history = new AgentStepRecord(modelOutputString, actionResultsCopy, browserStateHistory);
+        // Create step metadata with LLM usage information
+        const stepEndTime = Date.now();
+        const stepNumber = this.context.nSteps;
+        const llmUsage = this.getLastLLMUsage();
+        const llmDurationMs = this.getLastLLMDurationMs();
+        const stepMetadata = new StepMetadata(
+          stepStartTime,
+          stepEndTime,
+          inputTokens,
+          stepNumber,
+          llmUsage,
+          llmDurationMs,
+        );
+
+        // Log step statistics
+        logger.info(`[Navigator] Step ${stepNumber} completed:`, {
+          durationSeconds: stepMetadata.durationSeconds.toFixed(2),
+          llmDurationSeconds: stepMetadata.llmDurationSeconds.toFixed(2),
+          inputTokens: stepMetadata.inputTokens,
+          llmUsage: stepMetadata.llmUsage
+            ? {
+                promptTokens: stepMetadata.llmUsage.promptTokens,
+                completionTokens: stepMetadata.llmUsage.completionTokens,
+                totalTokens: stepMetadata.llmUsage.totalTokens,
+              }
+            : 'N/A',
+          actionCount: actionResultsCopy.length,
+        });
+
+        const history = new AgentStepRecord(modelOutputString, actionResultsCopy, browserStateHistory, stepMetadata);
         this.context.history.history.push(history);
 
         // logger.info('All history', JSON.stringify(this.context.history, null, 2));
@@ -502,48 +381,6 @@ export class NavigatorAgent extends BaseAgent<z.ZodType, NavigatorResult> {
   }
 
   /**
-   * Relaxed fallback when strict schema validation fails: normalize current_state and action
-   * so that fixActions/doMultiAction can still execute (e.g. GLM returns valid shape but schema differs).
-   */
-  private tryRelaxedNavigatorOutput(parsed: Record<string, unknown>): this['ModelOutput'] | undefined {
-    const cs = parsed.current_state;
-    const actionRaw = parsed.action;
-    if (!cs || typeof cs !== 'object' || !Array.isArray(actionRaw) || actionRaw.length === 0) return undefined;
-    const state = cs as Record<string, unknown>;
-    const evaluation_previous_goal =
-      typeof state.evaluation_previous_goal === 'string' ? state.evaluation_previous_goal : '';
-    const memory = typeof state.memory === 'string' ? state.memory : '';
-    const next_goal = typeof state.next_goal === 'string' ? state.next_goal : '';
-    const action: Record<string, unknown>[] = [];
-    for (const item of actionRaw) {
-      if (item && typeof item === 'object' && !Array.isArray(item)) {
-        const keys = Object.keys(item as object).filter(k => (item as Record<string, unknown>)[k] != null);
-        if (keys.length === 1) action.push({ [keys[0]]: (item as Record<string, unknown>)[keys[0]] });
-      }
-    }
-    if (action.length === 0) return undefined;
-    const normalized = {
-      current_state: { evaluation_previous_goal, memory, next_goal },
-      action,
-    };
-    const validated = this.validateModelOutput(normalized);
-    if (validated) return validated;
-    return normalized as this['ModelOutput'];
-  }
-
-  protected override manuallyParseResponse(content: string): this['ModelOutput'] | undefined {
-    const out = super.manuallyParseResponse(content);
-    if (out) return out;
-    try {
-      const cleaned = removeThinkTags(content);
-      const extracted = extractJsonFromModelOutput(cleaned);
-      return this.tryRelaxedNavigatorOutput(extracted);
-    } catch {
-      return undefined;
-    }
-  }
-
-  /**
    * Fix the actions to be an array of objects, sometimes the action is a string or an object
    * @param response
    * @returns
@@ -551,14 +388,13 @@ export class NavigatorAgent extends BaseAgent<z.ZodType, NavigatorResult> {
   private fixActions(response: this['ModelOutput']): Record<string, unknown>[] {
     let actions: Record<string, unknown>[] = [];
     if (Array.isArray(response.action)) {
-      // skip null and items that are not single-key objects (avoids "Action undefined not exists")
+      // 过滤掉 null、非对象以及空对象（没有任何 action 名称）的项
       actions = response.action.filter((item: unknown) => {
-        if (item === null || typeof item !== 'object' || Array.isArray(item)) return false;
-        const keys = Object.keys(item as object).filter(k => (item as Record<string, unknown>)[k] != null);
-        return keys.length === 1 && !!keys[0];
+        if (!item || typeof item !== 'object') return false;
+        return Object.keys(item as Record<string, unknown>).length > 0;
       }) as Record<string, unknown>[];
       if (actions.length === 0) {
-        logger.warning('No valid actions found', response.action);
+        logger.warning('No valid actions found in navigator output', response.action);
       }
     } else if (typeof response.action === 'string') {
       try {
@@ -576,11 +412,167 @@ export class NavigatorAgent extends BaseAgent<z.ZodType, NavigatorResult> {
           throw new Error('Invalid action output format');
         }
       }
-    } else {
-      // if the action is neither an array nor a string, it should be an object
-      actions = [response.action];
+    } else if (response.action && typeof response.action === 'object') {
+      // 单个对象时，同样需要确保不是空对象
+      const obj = response.action as Record<string, unknown>;
+      if (Object.keys(obj).length > 0) {
+        actions = [obj];
+      } else {
+        logger.warning('Navigator output action is an empty object, ignoring', obj);
+      }
+    } else if (response.action != null) {
+      logger.warning('Navigator output action has unexpected type, ignoring', typeof response.action);
     }
+
+    // Normalize/split actions and map aliases (e.g. switch_to_tab -> switch_tab)
+    actions = this.normalizeAndSplitActions(actions);
+
+    // 如果到这里依然没有解析出任何可执行的 action，尝试在整个 modelOutput 中智能挖掘
+    if (actions.length === 0) {
+      const recovered: Record<string, unknown>[] = [];
+      const actionNames = this.actionRegistry.getActionNames();
+      this.collectActionsFromAnyField(response, actionNames, recovered);
+      actions = this.normalizeAndSplitActions(recovered);
+
+      if (actions.length > 0) {
+        logger.info('Recovered navigator actions from loose structure', actions);
+      }
+    }
+
     return actions;
+  }
+
+  private normalizeActionKey(rawKey: string): string {
+    return rawKey
+      .trim()
+      .toLowerCase()
+      .replace(/[\s-]+/g, '_')
+      .replace(/__+/g, '_');
+  }
+
+  /**
+   * Resolve "near-synonym" / alias action names from LLM output into canonical local action names.
+   * Keep this conservative to avoid accidental wrong actions.
+   */
+  private resolveActionName(rawKey: string): string | null {
+    const key = this.normalizeActionKey(rawKey);
+    const actionNames = this.actionRegistry.getActionNames();
+    if (actionNames.includes(key)) return key;
+
+    // Explicit aliases (common mismatch between different prompt/schema variants)
+    const aliasMap: Record<string, string> = {
+      switch_to_tab: 'switch_tab',
+      switch_to_tabs: 'switch_tab',
+      switch_tab_to: 'switch_tab',
+      goto_url: 'go_to_url',
+      go_to: 'go_to_url',
+      click: 'click_element',
+      click_item: 'click_element',
+      click_button: 'click_element',
+      input: 'input_text',
+      type_text: 'input_text',
+      enter_text: 'input_text',
+      open_new_tab: 'open_tab',
+      new_tab: 'open_tab',
+      close_current_tab: 'close_tab',
+      close_current_tabs: 'close_tab',
+      search: 'search_google',
+      google_search: 'search_google',
+    };
+
+    const aliased = aliasMap[key];
+    if (aliased && actionNames.includes(aliased)) return aliased;
+
+    // Heuristic fallbacks for very common variants (only when strongly indicated)
+    // Note: we intentionally do NOT "remove _to_" globally because it would break go_to_url.
+    const has = (s: string) => key.includes(s);
+    const candidates: string[] = [];
+    if (has('switch') && has('tab')) candidates.push('switch_tab');
+    if ((has('go') || has('goto') || has('navigate')) && has('url')) candidates.push('go_to_url');
+    if (has('click')) candidates.push('click_element');
+    if ((has('input') || has('type') || has('enter')) && has('text')) candidates.push('input_text');
+    if (has('open') && has('tab')) candidates.push('open_tab');
+    if (has('close') && has('tab')) candidates.push('close_tab');
+    if (has('search') && has('google')) candidates.push('search_google');
+    if (has('send') && (has('key') || has('keys'))) candidates.push('send_keys');
+
+    const uniq = [...new Set(candidates)].filter(c => actionNames.includes(c));
+    return uniq.length === 1 ? uniq[0] : null;
+  }
+
+  /**
+   * Some models may output one object containing multiple action keys (because the schema allows it),
+   * or use alias keys. This normalizes them into an array of {canonicalActionName: args}.
+   */
+  private normalizeAndSplitActions(actions: Record<string, unknown>[]): Record<string, unknown>[] {
+    const normalized: Record<string, unknown>[] = [];
+
+    for (const actionObj of actions) {
+      if (!actionObj || typeof actionObj !== 'object') continue;
+      const entries = Object.entries(actionObj);
+      for (const [rawKey, rawVal] of entries) {
+        if (rawVal === null || rawVal === undefined) continue;
+        if (typeof rawVal !== 'object') continue;
+
+        const resolved = this.resolveActionName(rawKey);
+        if (!resolved) {
+          logger.warning(`Unknown action key from model output: "${rawKey}"`);
+          continue;
+        }
+        normalized.push({ [resolved]: rawVal as Record<string, unknown> });
+      }
+    }
+
+    return normalized;
+  }
+
+  /**
+   * 深度遍历任意 JSON 结构，从中提取形如 {actionName: {...}} 的片段，
+   * 其中 actionName 必须是当前已注册的 action 名称之一。
+   */
+  private collectActionsFromAnyField(
+    node: unknown,
+    actionNames: string[],
+    out: Record<string, unknown>[],
+  ): void {
+    if (!node) return;
+
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        this.collectActionsFromAnyField(item, actionNames, out);
+      }
+      return;
+    }
+
+    if (typeof node !== 'object') {
+      return;
+    }
+
+    const obj = node as Record<string, unknown>;
+    const keys = Object.keys(obj);
+    if (keys.length > 0) {
+      const matchedKeys = keys.filter(k => this.resolveActionName(k) !== null);
+
+      // 如果当前对象本身就长得像一个 action（只包含一个合法 action 名称），直接加入候选
+      if (matchedKeys.length === 1) {
+        const rawKey = matchedKeys[0];
+        const resolvedKey = this.resolveActionName(rawKey);
+        if (!resolvedKey) {
+          // should not happen due to matchedKeys filter
+          return;
+        }
+
+        const value = obj[rawKey];
+        if (value && typeof value === 'object') {
+          out.push({ [resolvedKey]: value as Record<string, unknown> });
+        }
+      }
+    }
+
+    // 继续递归遍历所有子字段，尽量挖掘嵌套结构中的 action 片段
+    for (const value of Object.values(obj)) {
+      this.collectActionsFromAnyField(value, actionNames, out);
+    }
   }
 
   private async doMultiAction(actions: Record<string, unknown>[]): Promise<ActionResult[]> {
@@ -601,14 +593,6 @@ export class NavigatorAgent extends BaseAgent<z.ZodType, NavigatorResult> {
         // check if the task is paused or stopped
         if (this.context.paused || this.context.stopped) {
           return results;
-        }
-
-        if (actionName === undefined || actionName === '') {
-          logger.warning('Skipping action with no name', { action, index: i });
-          results.push(
-            new ActionResult({ error: 'Action has no name', isDone: false, includeInMemory: true }),
-          );
-          continue;
         }
 
         const actionInstance = this.actionRegistry.getAction(actionName);
@@ -658,6 +642,9 @@ export class NavigatorAgent extends BaseAgent<z.ZodType, NavigatorResult> {
         // TODO: wait for 1 second for now, need to optimize this to avoid unnecessary waiting
         await new Promise(resolve => setTimeout(resolve, 1000));
       } catch (error) {
+        if (error instanceof URLNotAllowedError) {
+          throw error;
+        }
         const errorMessage = error instanceof Error ? error.message : String(error);
         logger.error(
           'doAction error',

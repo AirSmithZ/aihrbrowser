@@ -1,5 +1,5 @@
 import type { BaseChatModel } from '@langchain/core/language_models/chat_models';
-import { type ActionResult, AgentContext, type AgentOptions, type AgentOutput } from './types';
+import { ActionResult, AgentContext, type AgentOptions, type AgentOutput } from './types';
 import { t } from '@extension/i18n';
 import { NavigatorAgent, NavigatorActionRegistry } from './agents/navigator';
 import { PlannerAgent, type PlannerOutput } from './agents/planner';
@@ -11,23 +11,21 @@ import type BrowserContext from '../browser/context';
 import { ActionBuilder } from './actions/builder';
 import { EventManager } from './event/manager';
 import { Actors, type EventCallback, EventType, ExecutionState } from './event/types';
+import { DownloadManager } from '../services/downloadManager';
 import {
   ChatModelAuthError,
   ChatModelBadRequestError,
   ChatModelForbiddenError,
-  ChatModelServiceUnavailableError,
   ExtensionConflictError,
   RequestCancelledError,
+  MaxStepsReachedError,
   MaxFailuresReachedError,
 } from './agents/errors';
+import { URLNotAllowedError } from '../browser/views';
 import { chatHistoryStore } from '@extension/storage/lib/chat';
 import type { AgentStepHistory } from './history';
 import type { GeneralSettingsConfig } from '@extension/storage';
-import {
-  isDownloadTask,
-  validateDownloadSuccess,
-  type DownloadValidationResult,
-} from '../services/downloadValidator';
+import { analytics } from '../services/analytics';
 
 const logger = createLogger('Executor');
 
@@ -65,6 +63,8 @@ export class Executor {
       eventManager,
       extraArgs?.agentOptions ?? {},
     );
+    // Attach download manager (requires "downloads" permission)
+    context.downloadManager = new DownloadManager();
 
     this.generalSettings = extraArgs?.generalSettings;
     this.tasks.push(task);
@@ -110,54 +110,16 @@ export class Executor {
   }
 
   /**
-   * Check if task is complete: executor operations done (planner or navigator says done)
-   * and, for download tasks, browser download success (completed count >= expected).
+   * Check if task is complete based on planner output and handle completion
    */
-  private checkTaskCompletion(
-    planOutput: AgentOutput<PlannerOutput> | null,
-    navigatorHadReportedDone?: boolean,
-    downloadValidation?: DownloadValidationResult,
-  ): boolean {
-    const task = this.tasks[this.tasks.length - 1] ?? '';
-    const nextSteps = planOutput?.result?.next_steps;
-    const isDownload = isDownloadTask(task, nextSteps);
-
-    // Planner confirms done
+  private checkTaskCompletion(planOutput: AgentOutput<PlannerOutput> | null): boolean {
     if (planOutput?.result?.done) {
-      if (isDownload && downloadValidation && !downloadValidation.success) {
-        logger.info('⏳ Planner says done but download not verified yet; waiting for download');
-        return false;
-      }
       logger.info('✅ Planner confirms task completion');
       if (planOutput.result.final_answer) {
         this.context.finalAnswer = planOutput.result.final_answer;
       }
       return true;
     }
-
-    // Navigator reported completion (done action executed)
-    if (navigatorHadReportedDone && planOutput?.result) {
-      if (isDownload && downloadValidation && !downloadValidation.success) {
-        logger.info('⏳ Navigator says done but download not verified yet; waiting for download');
-        return false;
-      }
-      logger.info('✅ Navigator reported completion; trusting navigator');
-      if (planOutput.result.final_answer) {
-        this.context.finalAnswer = planOutput.result.final_answer;
-      } else {
-        this.context.finalAnswer = planOutput.result.observation || this.context.taskId;
-      }
-      return true;
-    }
-
-    // Download task: browser download verified (completed count >= expected) — complete even without planner/navigator done
-    if (isDownload && downloadValidation?.success) {
-      logger.info('✅ Browser download verified; task complete');
-      this.context.finalAnswer =
-        downloadValidation.summary ?? planOutput?.result?.observation ?? this.context.taskId;
-      return true;
-    }
-
     return false;
   }
 
@@ -176,14 +138,12 @@ export class Executor {
     try {
       this.context.emitEvent(Actors.SYSTEM, ExecutionState.TASK_START, this.context.taskId);
 
-      const taskStartTime = Date.now();
+      // Track task start
+      void analytics.trackTaskStart(this.context.taskId);
+
       let step = 0;
       let latestPlanOutput: AgentOutput<PlannerOutput> | null = null;
       let navigatorDone = false;
-      let lastStepRanPlanner = false;
-      let completedByCheck = false;
-      let lastPlanNextSteps = '';
-      let samePlanCount = 0;
 
       for (step = 0; step < allowedMaxSteps; step++) {
         context.stepInfo = {
@@ -191,57 +151,161 @@ export class Executor {
           maxSteps: context.options.maxSteps,
         };
 
+        // === 下载检测兜底逻辑（轮询 chrome.downloads）===
+        // 如果此时上下文中还没有正在追踪的下载任务，但当前 tab 在最近 10s 内有过下载，
+        // 就通过 DownloadManager.findLatestDownloadSince 主动「接管」这个下载。
+        if (!context.downloadState?.inProgress && context.downloadManager) {
+          try {
+            const currentPage = await context.browserContext.getCurrentPage();
+            const sinceMs = Date.now() - 10_000; // look back 10 seconds
+            const snapshot = await context.downloadManager.findLatestDownloadSince({
+              sinceMs,
+              tabId: currentPage.tabId,
+            });
+            if (snapshot && snapshot.state !== 'complete') {
+              logger.info('[Executor] 兜底检测到下载任务，准备接管', snapshot);
+              context.downloadState = {
+                inProgress: true,
+                downloadId: snapshot.downloadId,
+                startedAtMs: Date.now(),
+              };
+              await context.emitEvent(
+                Actors.NAVIGATOR,
+                ExecutionState.ACT_START,
+                `Download detected (fallback, id=${snapshot.downloadId})`,
+              );
+            }
+          } catch (error) {
+            logger.info(
+              `Failed to run download fallback detection: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+          }
+        }
+
         logger.info(`🔄 Step ${step + 1} / ${allowedMaxSteps}`);
         if (await this.shouldStop()) {
           break;
         }
 
-        // Run planner periodically or when navigator says done (to validate), but not twice in a row
-        const shouldRunPlanner =
-          this.planner &&
-          (context.nSteps % context.options.planningInterval === 0 ||
-            (navigatorDone && !lastStepRanPlanner));
-        const navigatorHadReportedDone = navigatorDone && !lastStepRanPlanner;
-        if (shouldRunPlanner) {
-          navigatorDone = false;
-          lastStepRanPlanner = true;
-          // Hint planner when same step executed multiple times (soft hint only)
-          if (samePlanCount >= 2) {
-            context.repeatedStepHint = true;
+        // === 下载进行中：阻塞其余 Agent 工作，直到下载结束 ===
+        if (context.downloadState?.inProgress && context.downloadManager) {
+          const { downloadId } = context.downloadState;
+          await context.emitEvent(Actors.NAVIGATOR, ExecutionState.ACT_START, `Downloading... (id=${downloadId})`);
+
+          let lastDownloadState: string | undefined;
+          const result = await context.downloadManager.waitForCompletion(downloadId, {
+            signal: context.controller.signal,
+            onProgress: async snapshot => {
+              const { state, percent, bytesReceived, totalBytes, filename } = snapshot;
+              if (!state) {
+                return;
+              }
+
+              // Only emit when the download state actually changes
+              if (state === lastDownloadState) {
+                return;
+              }
+              lastDownloadState = state;
+
+              let progressDetail = '';
+              if (percent !== null && percent !== undefined) {
+                progressDetail = `${percent}%`;
+              } else if (
+                bytesReceived !== undefined &&
+                totalBytes !== undefined &&
+                totalBytes > 0
+              ) {
+                progressDetail = `${bytesReceived}/${totalBytes}`;
+              } else if (bytesReceived !== undefined) {
+                progressDetail = `${bytesReceived}`;
+              }
+
+              const fileText = filename ? ` ${filename.split('/').pop()}` : '';
+
+              // Map chrome.downloads state to execution state
+              let execState: ExecutionState = ExecutionState.ACT_START;
+              if (state === 'complete') {
+                execState = ExecutionState.ACT_OK;
+              } else if (state === 'interrupted') {
+                execState = ExecutionState.ACT_FAIL;
+              }
+
+              const stateLabel = state;
+              const message = progressDetail
+                ? `Download ${stateLabel}: ${progressDetail}${fileText}`
+                : `Download ${stateLabel}${fileText}`;
+
+              await context.emitEvent(Actors.NAVIGATOR, execState, message);
+            },
+          });
+
+          logger.info('[Executor] 下载等待结束', result);
+          context.downloadState.inProgress = false;
+
+          if (result.success) {
+            await context.emitEvent(
+              Actors.NAVIGATOR,
+              ExecutionState.ACT_START,
+              `Download completed: ${result.filename ?? `id=${result.downloadId}`}`,
+            );
+          } else {
+            await context.emitEvent(
+              Actors.NAVIGATOR,
+              ExecutionState.ACT_FAIL,
+              `Download failed (${result.state}): ${result.error ?? ''}`.trim(),
+            );
           }
+
+          // === 下载结果写入记忆，让 Planner 能感知本次下载状态 ===
+          // 这里不直接判断「整体任务是否完成」，而是把“本次下载结果”作为 ActionResult
+          // 写入 context.actionResults，后续 Navigator 在 addStateMessageToMemory 时会把它
+          // 转成一条 HumanMessage，供 Planner 阅读和决策。
+          const downloadSummaryParts: string[] = [];
+          downloadSummaryParts.push(
+            result.success ? '下载完成' : `下载未完成，状态: ${result.state}${result.error ? `，错误: ${result.error}` : ''}`,
+          );
+          if (result.filename) {
+            downloadSummaryParts.push(`文件: ${result.filename}`);
+          }
+          if (result.url) {
+            downloadSummaryParts.push(`来源 URL: ${result.url}`);
+          }
+          const downloadSummary = downloadSummaryParts.join('；');
+
+          context.actionResults.push(
+            new ActionResult({
+              extractedContent: `[下载结果] ${downloadSummary}`,
+              includeInMemory: true,
+            }),
+          );
+
+          // 下载任务结束后，直接告知planner当前任务下载完成执行agent，就不需要再走navigator，节约执行时间
+          logger.info('[Executor] 下载任务完成，直接运行planner，跳过navigator');
           latestPlanOutput = await this.runPlanner();
-
-          if (latestPlanOutput?.result) {
-            const nextSteps = String(latestPlanOutput.result.next_steps ?? '').trim();
-            if (nextSteps && nextSteps === lastPlanNextSteps) {
-              samePlanCount++;
-            } else {
-              samePlanCount = 1;
-              lastPlanNextSteps = nextSteps;
-            }
-          }
-
-          // Validate browser download success for download tasks (single or multiple files)
-          const task = this.tasks[this.tasks.length - 1] ?? '';
-          const planNextSteps = latestPlanOutput?.result?.next_steps;
-          let downloadValidation: DownloadValidationResult | undefined;
-          if (isDownloadTask(task, planNextSteps)) {
-            downloadValidation = await validateDownloadSuccess(task, taskStartTime, planNextSteps);
-          }
-
-          if (this.checkTaskCompletion(latestPlanOutput, navigatorHadReportedDone, downloadValidation)) {
-            completedByCheck = true;
+          if (this.checkTaskCompletion(latestPlanOutput)) {
             break;
           }
-        } else {
-          lastStepRanPlanner = false;
+
+          // Continue loop after download handling (don't run navigator in same iteration)
+          // 下载任务完成后，直接跳过navigator，继续下一轮循环
+          continue;
+        }
+
+        // Run planner periodically for guidance
+        if (this.planner && (context.nSteps % context.options.planningInterval === 0 || navigatorDone)) {
+          navigatorDone = false;
+          latestPlanOutput = await this.runPlanner();
+
+          // Check if task is complete after planner run
+          if (this.checkTaskCompletion(latestPlanOutput)) {
+            break;
+          }
         }
 
         // Execute navigator
         navigatorDone = await this.navigate();
-
-        // Ensure next planner run gets fresh state (sync: invalidate state so addStateMessageToMemory adds new state).
-        context.stateMessageAdded = false;
 
         // If navigator indicates completion, the next periodic planner run will validate it
         if (navigatorDone) {
@@ -249,18 +313,29 @@ export class Executor {
         }
       }
 
-      // Determine task completion status (include completion by navigator trust)
-      const isCompleted = completedByCheck || latestPlanOutput?.result?.done === true;
+      // Determine task completion status
+      const isCompleted = latestPlanOutput?.result?.done === true;
 
       if (isCompleted) {
         // Emit final answer if available, otherwise use task ID
         const finalMessage = this.context.finalAnswer || this.context.taskId;
         this.context.emitEvent(Actors.SYSTEM, ExecutionState.TASK_OK, finalMessage);
+
+        // Track task completion
+        void analytics.trackTaskComplete(this.context.taskId);
       } else if (step >= allowedMaxSteps) {
         logger.error('❌ Task failed: Max steps reached');
         this.context.emitEvent(Actors.SYSTEM, ExecutionState.TASK_FAIL, t('exec_errors_maxStepsReached'));
+
+        // Track task failure with specific error category
+        const maxStepsError = new MaxStepsReachedError(t('exec_errors_maxStepsReached'));
+        const errorCategory = analytics.categorizeError(maxStepsError);
+        void analytics.trackTaskFailed(this.context.taskId, errorCategory);
       } else if (this.context.stopped) {
         this.context.emitEvent(Actors.SYSTEM, ExecutionState.TASK_CANCEL, t('exec_task_cancel'));
+
+        // Track task cancellation
+        void analytics.trackTaskCancelled(this.context.taskId);
       } else {
         this.context.emitEvent(Actors.SYSTEM, ExecutionState.TASK_PAUSE, t('exec_task_pause'));
         // Note: We don't track pause as it's not a final state
@@ -268,9 +343,16 @@ export class Executor {
     } catch (error) {
       if (error instanceof RequestCancelledError) {
         this.context.emitEvent(Actors.SYSTEM, ExecutionState.TASK_CANCEL, t('exec_task_cancel'));
+
+        // Track task cancellation
+        void analytics.trackTaskCancelled(this.context.taskId);
       } else {
         const errorMessage = error instanceof Error ? error.message : String(error);
         this.context.emitEvent(Actors.SYSTEM, ExecutionState.TASK_FAIL, t('exec_task_fail', [errorMessage]));
+
+        // Track task failure with detailed error categorization
+        const errorCategory = analytics.categorizeError(error instanceof Error ? error : errorMessage);
+        void analytics.trackTaskFailed(this.context.taskId, errorCategory);
       }
     } finally {
       if (import.meta.env.DEV) {
@@ -293,11 +375,14 @@ export class Executor {
   private async runPlanner(): Promise<AgentOutput<PlannerOutput> | null> {
     const context = this.context;
     try {
-      // Force fresh state so planner always sees latest action results (fixes repeated requests from stale data).
-      context.stateMessageAdded = false;
-      // Always add current browser state so planner has up-to-date context (including first run).
-      await this.navigator.addStateMessageToMemory();
-      const positionForPlan = this.context.messageManager.length() - 1;
+      // Add current browser state to memory
+      let positionForPlan = 0;
+      if (this.tasks.length > 1 || this.context.nSteps > 0) {
+        await this.navigator.addStateMessageToMemory();
+        positionForPlan = this.context.messageManager.length() - 1;
+      } else {
+        positionForPlan = this.context.messageManager.length();
+      }
 
       // Execute planner
       const planOutput = await this.planner.execute();
@@ -311,7 +396,7 @@ export class Executor {
         error instanceof ChatModelAuthError ||
         error instanceof ChatModelBadRequestError ||
         error instanceof ChatModelForbiddenError ||
-        error instanceof ChatModelServiceUnavailableError ||
+        error instanceof URLNotAllowedError ||
         error instanceof RequestCancelledError ||
         error instanceof ExtensionConflictError
       ) {
@@ -353,7 +438,7 @@ export class Executor {
         error instanceof ChatModelAuthError ||
         error instanceof ChatModelBadRequestError ||
         error instanceof ChatModelForbiddenError ||
-        error instanceof ChatModelServiceUnavailableError ||
+        error instanceof URLNotAllowedError ||
         error instanceof RequestCancelledError ||
         error instanceof ExtensionConflictError
       ) {
@@ -391,8 +476,6 @@ export class Executor {
 
   async cancel(): Promise<void> {
     this.context.stop();
-    // Emit TASK_CANCEL immediately so saveTaskEndLog runs even when the run loop is blocked (e.g. in LLM or tab wait).
-    await this.context.emitEvent(Actors.SYSTEM, ExecutionState.TASK_CANCEL, t('exec_task_cancel'));
   }
 
   async resume(): Promise<void> {

@@ -2,8 +2,10 @@ import 'webextension-polyfill';
 import {
   agentModelStore,
   AgentNameEnum,
+  firewallStore,
   generalSettingsStore,
   llmProviderStore,
+  analyticsSettingsStore,
 } from '@extension/storage';
 import { t } from '@extension/i18n';
 import BrowserContext from './browser/context';
@@ -13,9 +15,14 @@ import { ExecutionState } from './agent/event/types';
 import { createChatModel } from './agent/helper';
 import type { BaseChatModel } from '@langchain/core/language_models/chat_models';
 import { DEFAULT_AGENT_OPTIONS } from './agent/types';
+import {
+  DEFAULT_GLM_PROVIDER_ID,
+  DEFAULT_GLM_PROVIDER_CONFIG,
+  getDefaultAgentModels,
+} from './defaultGlmConfig';
 import { SpeechToTextService } from './services/speechToText';
-import { saveTaskEndLog } from './services/requestLog';
 import { injectBuildDomTreeScripts } from './browser/dom/service';
+import { analytics } from './services/analytics';
 
 const logger = createLogger('background');
 
@@ -52,29 +59,17 @@ chrome.tabs.onRemoved.addListener(tabId => {
 
 logger.info('background loaded');
 
-/**
- * Remove all comment fields (keys starting with "__comment") from an object recursively
- */
-function removeCommentFields(obj: unknown): unknown {
-  if (obj === null || typeof obj !== 'object') {
-    return obj;
-  }
+// Initialize analytics
+analytics.init().catch(error => {
+  logger.error('Failed to initialize analytics:', error);
+});
 
-  if (Array.isArray(obj)) {
-    return obj.map(item => removeCommentFields(item));
-  }
-
-  const result: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(obj)) {
-    // Skip comment fields
-    if (key.startsWith('__comment')) {
-      continue;
-    }
-    // Recursively process nested objects
-    result[key] = removeCommentFields(value);
-  }
-  return result;
-}
+// Listen for analytics settings changes
+analyticsSettingsStore.subscribe(() => {
+  analytics.updateSettings().catch(error => {
+    logger.error('Failed to update analytics settings:', error);
+  });
+});
 
 // Listen for simple messages (e.g., from options page)
 chrome.runtime.onMessage.addListener(() => {
@@ -275,153 +270,29 @@ chrome.runtime.onConnect.addListener(port => {
   }
 });
 
-async function loadConfigFromJson() {
-  try {
-    // Note: keep this as info (not error) to avoid noisy red stack traces in console
-    logger.info('loadConfigFromJson() invoked');
-    const url = chrome.runtime.getURL('aihr.config.local.json');
-    logger.info('Loading config from:', url);
-    const response = await fetch(url);
-    if (!response.ok) {
-      logger.info(`Config file not found or not accessible: ${response.status} ${response.statusText}`);
-      return;
-    }
-    const rawData = await response.json();
-    logger.info('Raw config loaded, removing comment fields...');
-    // Remove comment fields before processing
-    const data = removeCommentFields(rawData) as {
-      providers?: Record<
-        string,
-        { apiKey: string; modelNames?: string[]; name?: string; type?: string; baseUrl?: string }
-      >;
-      models?: Record<string, { provider: string; modelName: string; parameters?: Record<string, unknown> }>;
-      general?: {
-        maxSteps?: number;
-        maxActionsPerStep?: number;
-        maxFailures?: number;
-        useVision?: boolean;
-        useVisionForPlanner?: boolean;
-        planningInterval?: number;
-        displayHighlights?: boolean;
-        minWaitPageLoad?: number;
-        replayHistoricalTasks?: boolean;
-      };
-    };
-
-    logger.info('Config processed, providers found:', data.providers ? Object.keys(data.providers).length : 0);
-
-    if (data.providers) {
-      let loadedProvidersCount = 0;
-      for (const [id, cfg] of Object.entries(data.providers)) {
-        if (!cfg.apiKey || cfg.apiKey.trim() === '') {
-          logger.warning(`Skipping provider ${id}: apiKey is empty`);
-          continue;
-        }
-        logger.info(`Loading provider: ${id}, apiKey length: ${cfg.apiKey.length}`);
-        await llmProviderStore.setProvider(id, {
-          apiKey: cfg.apiKey,
-          modelNames: cfg.modelNames,
-          name: cfg.name,
-          type: cfg.type as never,
-          baseUrl: cfg.baseUrl,
-        });
-        loadedProvidersCount++;
-      }
-      logger.info(`Successfully loaded ${loadedProvidersCount} provider(s)`);
-    }
-
-    if (data.general) {
-      await generalSettingsStore.updateSettings(data.general);
-    }
-
-    if (data.models) {
-      logger.info('Loading models configuration...', Object.keys(data.models));
-      let loadedModelsCount = 0;
-      for (const [agentKey, cfg] of Object.entries(data.models)) {
-        // Support both enum *keys* (e.g. "Navigator") and enum *values* (e.g. "navigator")
-        // because local JSON configs typically use the value form.
-        const normalizedAgentKey = agentKey.trim().toLowerCase();
-        const agent =
-          (Object.values(AgentNameEnum).includes(normalizedAgentKey as AgentNameEnum)
-            ? (normalizedAgentKey as AgentNameEnum)
-            : AgentNameEnum[agentKey as keyof typeof AgentNameEnum]);
-        if (!agent) {
-          logger.warning(`Unknown agent key: ${agentKey}, skipping`);
-          continue;
-        }
-        if (!cfg.provider || !cfg.modelName) {
-          logger.warning(`Invalid model config for ${agentKey}: provider=${cfg.provider}, modelName=${cfg.modelName}`);
-          continue;
-        }
-        logger.info(`Setting model for agent ${agentKey}: provider=${cfg.provider}, model=${cfg.modelName}`);
-        await agentModelStore.setAgentModel(agent, {
-          provider: cfg.provider,
-          modelName: cfg.modelName,
-          parameters: cfg.parameters,
-        });
-        loadedModelsCount++;
-      }
-      logger.info(`Successfully loaded ${loadedModelsCount} model(s)`);
-      
-      // Verify that models were actually saved
-      const savedModels = await agentModelStore.getAllAgentModels();
-      logger.info('Verification - saved agent models:', Object.keys(savedModels));
-      for (const [agentKey, savedModel] of Object.entries(savedModels)) {
-        logger.info(`  ${agentKey}: provider=${savedModel.provider}, model=${savedModel.modelName}`);
-      }
-    } else {
-      logger.warning('No models configuration found in JSON file');
-    }
-
-    if (data.general) {
-      logger.info('Loading general settings...');
-      await generalSettingsStore.updateSettings(data.general);
-      logger.info('General settings loaded');
-    }
-
-    logger.info('Config loading completed successfully');
-  } catch (error) {
-    logger.error('Failed to load aihr.config.local.json:', error);
-    if (error instanceof Error) {
-      logger.error('Error details:', error.message, error.stack);
-    }
-  }
-}
-
 async function setupExecutor(taskId: string, task: string, browserContext: BrowserContext) {
-  // Try to hydrate providers/models from local JSON before using stores
-  await loadConfigFromJson();
-
-  const providers = await llmProviderStore.getAllProviders();
-  logger.info(`Current providers count: ${Object.keys(providers).length}`, Object.keys(providers));
-  // if no providers, need to display the options page
+  let providers = await llmProviderStore.getAllProviders();
+  // When no providers are configured, use default 智谱 GLM so user can chat without mandatory setup
   if (Object.keys(providers).length === 0) {
-    logger.error('No providers configured. Please check aihr.config.local.json or settings page.');
-    throw new Error(t('bg_setup_noApiKeys'));
+    providers = { [DEFAULT_GLM_PROVIDER_ID]: DEFAULT_GLM_PROVIDER_CONFIG };
   }
 
   // Clean up any legacy validator settings for backward compatibility
   await agentModelStore.cleanupLegacyValidatorSettings();
 
-  const agentModels = await agentModelStore.getAllAgentModels();
-  logger.info(`Current agent models:`, Object.keys(agentModels));
-  
+  let agentModels = await agentModelStore.getAllAgentModels();
+  // When no navigator model is configured, use default GLM for both Navigator and Planner
+  if (!agentModels[AgentNameEnum.Navigator]) {
+    agentModels = { ...getDefaultAgentModels(), ...agentModels };
+  }
   // verify if every provider used in the agent models exists in the providers
   for (const agentModel of Object.values(agentModels)) {
     if (!providers[agentModel.provider]) {
-      logger.error(`Provider ${agentModel.provider} not found in providers:`, Object.keys(providers));
       throw new Error(t('bg_setup_noProvider', [agentModel.provider]));
     }
   }
 
   const navigatorModel = agentModels[AgentNameEnum.Navigator];
-  if (!navigatorModel) {
-    logger.error(`Navigator model not found. Available agents:`, Object.keys(agentModels));
-    logger.error('Please ensure aihr.config.local.json contains models.navigator configuration');
-    throw new Error(t('bg_setup_noNavigatorModel'));
-  }
-  
-  logger.info(`Navigator model configured: provider=${navigatorModel.provider}, model=${navigatorModel.modelName}`);
   // Log the provider config being used for the navigator
   const navigatorProviderConfig = providers[navigatorModel.provider];
   const navigatorLLM = createChatModel(navigatorProviderConfig, navigatorModel);
@@ -434,8 +305,21 @@ async function setupExecutor(taskId: string, task: string, browserContext: Brows
     plannerLLM = createChatModel(plannerProviderConfig, plannerModel);
   }
 
+  // Apply firewall settings to browser context
+  const firewall = await firewallStore.getFirewall();
+  if (firewall.enabled) {
+    browserContext.updateConfig({
+      allowedUrls: firewall.allowList,
+      deniedUrls: firewall.denyList,
+    });
+  } else {
+    browserContext.updateConfig({
+      allowedUrls: [],
+      deniedUrls: [],
+    });
+  }
+
   const generalSettings = await generalSettingsStore.getSettings();
-  logger.info('generalSettings resolved (after JSON hydrate):', generalSettings);
   browserContext.updateConfig({
     minimumWaitPageLoadTime: generalSettings.minWaitPageLoad / 1000.0,
     displayHighlights: generalSettings.displayHighlights,
@@ -472,21 +356,10 @@ async function subscribeToExecutorEvents(executor: Executor) {
       logger.error('Failed to send message to side panel:', error);
     }
 
-    // Persist logs whenever task terminates (ok, fail, cancel, pause)
     if (
       event.state === ExecutionState.TASK_OK ||
       event.state === ExecutionState.TASK_FAIL ||
-      event.state === ExecutionState.TASK_CANCEL ||
-      event.state === ExecutionState.TASK_PAUSE
-    ) {
-      saveTaskEndLog(event.data.taskId, event.state, event.data.details);
-    }
-
-    if (
-      event.state === ExecutionState.TASK_OK ||
-      event.state === ExecutionState.TASK_FAIL ||
-      event.state === ExecutionState.TASK_CANCEL ||
-      event.state === ExecutionState.TASK_PAUSE
+      event.state === ExecutionState.TASK_CANCEL
     ) {
       await currentExecutor?.cleanup();
     }

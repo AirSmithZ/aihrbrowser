@@ -6,6 +6,7 @@ import type MessageManager from './messages/service';
 import type { EventManager } from './event/manager';
 import { type Actors, type ExecutionState, AgentEvent } from './event/types';
 import { AgentStepHistory } from './history';
+import type { DownloadManager } from '../services/downloadManager';
 
 export interface AgentOptions {
   maxSteps: number;
@@ -47,10 +48,17 @@ export class AgentContext {
   stepInfo: AgentStepInfo | null;
   actionResults: ActionResult[];
   stateMessageAdded: boolean;
-  /** When true, planner state will include a hint to mark task done (used after same step executed multiple times). */
-  repeatedStepHint: boolean;
   history: AgentStepHistory;
   finalAnswer: string | null;
+
+  /** Download manager (best-effort, requires downloads permission) */
+  downloadManager?: DownloadManager;
+  /** Download lock state: when inProgress, Executor pauses other agent work */
+  downloadState?: {
+    inProgress: boolean;
+    downloadId: number;
+    startedAtMs: number;
+  };
 
   constructor(
     taskId: string,
@@ -73,7 +81,6 @@ export class AgentContext {
     this.stepInfo = null;
     this.actionResults = [];
     this.stateMessageAdded = false;
-    this.repeatedStepHint = false;
     this.history = new AgentStepHistory();
     this.finalAnswer = null;
   }
@@ -134,17 +141,34 @@ export type WrappedActionResult = ActionResult & {
   toolCallId: string;
 };
 
+export interface LLMUsage {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+}
+
 export class StepMetadata {
   stepStartTime: number;
   stepEndTime: number;
   inputTokens: number;
   stepNumber: number;
+  llmUsage?: LLMUsage;
+  llmDurationMs?: number;
 
-  constructor(stepStartTime: number, stepEndTime: number, inputTokens: number, stepNumber: number) {
+  constructor(
+    stepStartTime: number,
+    stepEndTime: number,
+    inputTokens: number,
+    stepNumber: number,
+    llmUsage?: LLMUsage,
+    llmDurationMs?: number,
+  ) {
     this.stepStartTime = stepStartTime;
     this.stepEndTime = stepEndTime;
     this.inputTokens = inputTokens;
     this.stepNumber = stepNumber;
+    this.llmUsage = llmUsage;
+    this.llmDurationMs = llmDurationMs;
   }
 
   /**
@@ -152,6 +176,13 @@ export class StepMetadata {
    */
   get durationSeconds(): number {
     return this.stepEndTime - this.stepStartTime;
+  }
+
+  /**
+   * Calculate LLM duration in seconds
+   */
+  get llmDurationSeconds(): number {
+    return this.llmDurationMs ? this.llmDurationMs / 1000 : 0;
   }
 }
 

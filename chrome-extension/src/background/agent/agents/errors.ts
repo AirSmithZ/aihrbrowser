@@ -4,7 +4,7 @@ export const LLM_FORBIDDEN_ERROR_MESSAGE =
 export const EXTENSION_CONFLICT_ERROR_MESSAGE = `
   Cannot access a chrome-extension:// URL of different extension.
   
-  This is likely due to conflicting extensions. Please use AIHR in a new profile.`;
+  This is likely due to conflicting extensions. Please use AutoBrowser in a new profile.`;
 
 /**
  * Custom error class for chat model authentication errors
@@ -133,37 +133,6 @@ export function isAuthenticationError(error: unknown): boolean {
 export function isForbiddenError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   return error.message.includes(' 403') && error.message.includes('Forbidden');
-}
-
-/**
- * Checks if an error is HTTP 503 Service Unavailable (API overload, maintenance, or transient).
- *
- * @param error - The error to check
- * @returns boolean indicating if it's a 503 Service Unavailable error
- */
-export function isServiceUnavailableError(error: unknown): boolean {
-  if (!(error instanceof Error)) return false;
-  const msg = error.message;
-  return msg.includes(' 503') || msg.includes('HTTP 503') || /\(HTTP 503\)/.test(msg) || /"code":\s*503/.test(msg);
-}
-
-/**
- * Custom error class for LLM API 503 Service Unavailable (transient, retry later).
- */
-export class ChatModelServiceUnavailableError extends Error {
-  constructor(
-    message: string,
-    public readonly cause?: unknown,
-  ) {
-    super(message);
-    this.name = 'ChatModelServiceUnavailableError';
-    if (Error.captureStackTrace) {
-      Error.captureStackTrace(this, ChatModelServiceUnavailableError);
-    }
-  }
-  toString(): string {
-    return `${this.name}: ${this.message}${this.cause ? ` (Caused by: ${this.cause})` : ''}`;
-  }
 }
 
 /**

@@ -97,7 +97,7 @@ flowchart TB
 ## 前端架构
 
 - **侧边栏**（`pages/side-panel/`）：主交互界面，React + TypeScript + Tailwind；组件包括 SidePanel、ChatInput、MessageList、ChatHistoryList、BookmarkList；与 background 通过 Port 收发 `new_task`、`follow_up_task`、`cancel_task`、`execution` 等。
-- **选项页**（`pages/options/`）：扩展配置（API 密钥、模型、通用参数、防火墙等），读写 `@extension/storage`。
+- **历史会话页**（`pages/side-panel/`）：展开历史会话记录。
 - **内容脚本**（`pages/content/`）：注入到用户浏览的网页，配合 background 的 DOM 分析（可点击元素树等），不承载主 UI。
 - **共享包**：`@extension/storage`、`@extension/i18n`、`packages/shared`、`packages/ui`、`packages/tailwind-config` 供前端与 background 共用。
 
@@ -301,6 +301,68 @@ flowchart LR
 ```
 
 ---
+
+前后端架构图
+
+```mermaid
+flowchart TB
+    subgraph Chrome扩展环境["Chrome 扩展运行环境（Manifest V3）"]
+        subgraph 前端层["前端层（无HTTP服务）"]
+            SP[侧边栏<br/>pages/side-panel<br/>React+TS+Tailwind]
+            OP[历史会话页<br/>pages/side-panel<br/>React+TS+Tailwind]
+            CT[内容脚本<br/>pages/content<br/>注入网页的DOM分析脚本]
+        end
+
+        subgraph 共享包层["共享包层（多模块复用）"]
+            ST[storage<br/>chrome.storage封装]
+            I18N[i18n<br/>国际化]
+            SH[shared<br/>通用工具/类型]
+            UI[ui<br/>公共组件]
+        end
+
+        subgraph 后端层["后端层（Background Service Worker）"]
+            EN[入口分发<br/>background/index.ts<br/>Port消息监听/分发]
+            EX[Executor<br/>任务循环调度]
+            subgraph 智能体层["多智能体层"]
+                PL[PlannerAgent<br/>任务拆解/完成判断]
+                NV[NavigatorAgent<br/>生成浏览器动作]
+            end
+            subgraph 支撑层["支撑层"]
+                MM[MessageManager<br/>消息管理]
+                AB[ActionBuilder<br/>动作构建]
+            end
+        end
+
+        subgraph 浏览器自动化层["浏览器自动化层"]
+            BC[BrowserContext<br/>标签页/Page管理]
+            PG[Page<br/>CDP封装（点击/输入/截图）]
+            DOM[DOM服务<br/>Content Script配合分析]
+        end
+
+        subgraph LLM对接层["LLM 对接层"]
+            LC[LangChain.js<br/>多LLM适配<br/>OpenAI/Anthropic/Gemini/Ollama]
+        end
+    end
+
+    %% 依赖/数据流向
+    SP --> 共享包层
+    OP --> 共享包层
+    CT --> 共享包层
+    EN --> EX
+    EX --> PL
+    EX --> NV
+    PL --> LC
+    NV --> LC
+    NV --> AB
+    AB --> BC
+    BC --> PG
+    PG --> DOM
+    PL --> MM
+    NV --> MM
+    EN <-->|Port长连接| SP
+    前端层 <-->|chrome.storage| 共享包层
+    后端层 <-->|chrome.storage| 共享包层
+```
 
 ## 开发与构建
 
