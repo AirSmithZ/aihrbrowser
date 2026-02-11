@@ -355,6 +355,60 @@ export class Executor {
         void analytics.trackTaskFailed(this.context.taskId, errorCategory);
       }
     } finally {
+      // 打印整次任务的 LLM token 和时间开销，便于统计成本
+      const stats = this.context.llmStats;
+      if (stats) {
+        // 统计总调用次数
+        const totalLLMCalls = Object.values(stats.byAgent).reduce((sum, s) => sum + s.calls, 0);
+
+        // 按 GLM-4.7 官方单价计算本次任务成本（单位：美元）
+        // 参考价格：输入 $0.40 / 1M tokens，输出 $1.50 / 1M tokens
+        const GLM47_INPUT_PRICE_PER_M = 0.4;
+        const GLM47_OUTPUT_PRICE_PER_M = 1.5;
+        const glm47CostUSD =
+          (stats.totalPromptTokens / 1_000_000) * GLM47_INPUT_PRICE_PER_M +
+          (stats.totalCompletionTokens / 1_000_000) * GLM47_OUTPUT_PRICE_PER_M;
+
+        logger.info(
+          '[Executor] Task LLM cost statistics',
+          JSON.stringify(
+            {
+              taskId: this.context.taskId,
+              // 总 token & 时长
+              totalPromptTokens: stats.totalPromptTokens,
+              totalCompletionTokens: stats.totalCompletionTokens,
+              totalTokens: stats.totalTokens,
+              totalDurationMs: stats.totalDurationMs,
+              totalDurationSeconds: (stats.totalDurationMs / 1000).toFixed(2),
+              // 调用次数统计
+              totalLLMCalls,
+              // 基于 GLM-4.7 单价的本次任务成本估算
+              glm47Pricing: {
+                inputPricePerMTokensUSD: GLM47_INPUT_PRICE_PER_M,
+                outputPricePerMTokensUSD: GLM47_OUTPUT_PRICE_PER_M,
+                estimatedCostUSD: Number(glm47CostUSD.toFixed(6)),
+              },
+              // 分 agent 统计
+              byAgent: Object.fromEntries(
+                Object.entries(stats.byAgent).map(([agentId, s]) => [
+                  agentId,
+                  {
+                    calls: s.calls,
+                    promptTokens: s.promptTokens,
+                    completionTokens: s.completionTokens,
+                    totalTokens: s.totalTokens,
+                    totalDurationMs: s.totalDurationMs,
+                    totalDurationSeconds: (s.totalDurationMs / 1000).toFixed(2),
+                  },
+                ]),
+              ),
+            },
+            null,
+            2,
+          ),
+        );
+      }
+
       if (import.meta.env.DEV) {
         logger.debug('Executor history', JSON.stringify(this.context.history, null, 2));
       }

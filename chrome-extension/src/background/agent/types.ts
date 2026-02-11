@@ -50,6 +50,25 @@ export class AgentContext {
   stateMessageAdded: boolean;
   history: AgentStepHistory;
   finalAnswer: string | null;
+  /**
+   * Aggregated LLM usage statistics for the whole task
+   */
+  llmStats: {
+    totalPromptTokens: number;
+    totalCompletionTokens: number;
+    totalTokens: number;
+    totalDurationMs: number;
+    byAgent: Record<
+      string,
+      {
+        calls: number;
+        promptTokens: number;
+        completionTokens: number;
+        totalTokens: number;
+        totalDurationMs: number;
+      }
+    >;
+  };
 
   /** Download manager (best-effort, requires downloads permission) */
   downloadManager?: DownloadManager;
@@ -83,6 +102,13 @@ export class AgentContext {
     this.stateMessageAdded = false;
     this.history = new AgentStepHistory();
     this.finalAnswer = null;
+    this.llmStats = {
+      totalPromptTokens: 0,
+      totalCompletionTokens: 0,
+      totalTokens: 0,
+      totalDurationMs: 0,
+      byAgent: {},
+    };
   }
 
   async emitEvent(actor: Actors, state: ExecutionState, eventDetails: string) {

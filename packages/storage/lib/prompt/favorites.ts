@@ -4,15 +4,15 @@ import type { BaseStorage } from '../base/types';
 
 // Template data
 const defaultFavoritePrompts = [
-  {
-    title: '📚  小说下载任务',
-    content:
-      '下载一篇历史小说，地址为https://www.haodoo.net',
-  },
-  {
-    title: '🐦 电子书下载任务',
-    content: '下载电子书，https://zh.welib.org/slow_download/df8d45ab486d6b2dd722421887cbdeca/0/0',
-  },
+  // {
+  //   title: '📚  小说下载任务',
+  //   content:
+  //     '下载一篇历史小说，地址为https://www.haodoo.net',
+  // },
+  // {
+  //   title: '🐦 电子书下载任务',
+  //   content: '下载电子书，https://zh.welib.org/slow_download/df8d45ab486d6b2dd722421887cbdeca/0/0',
+  // },
   {
     title: '🌟 下载一个艺术设计的ppt',
     content:

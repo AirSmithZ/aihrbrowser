@@ -1,6 +1,6 @@
-# AIHR
+# auto
 
-AIHR 是一款开源的 **AI 网页自动化** Chrome 扩展，在浏览器内运行多智能体系统，支持多种 LLM 提供商（OpenAI、Anthropic、Gemini、Ollama 等），可视为 OpenAI Operator 的免费替代方案。
+auto 是一款开源的 **AI 网页自动化** Chrome 扩展，在浏览器内运行多智能体系统，支持多种 LLM 提供商（OpenAI、Anthropic、Gemini、Ollama 等），可视为 OpenAI Operator 的免费替代方案。
 
 ## 技术栈
 
@@ -17,11 +17,11 @@ AIHR 是一款开源的 **AI 网页自动化** Chrome 扩展，在浏览器内�
 ## 项目结构
 
 ```
-aihrbrowser/
+autobrowser/
 ├── chrome-extension/       # 扩展核心：Background Service Worker、Agent、Browser
 ├── pages/                  # 扩展 UI 与脚本
 │   ├── side-panel/         # 侧边栏（主界面）
-│   ├── options/            # 选项页（配置）
+│   ├── options/            # 历史会话页（配置）
 │   └── content/            # 内容脚本（注入页面）
 ├── packages/               # 共享包
 │   ├── storage/            # 配置与存储
@@ -41,16 +41,16 @@ aihrbrowser/
 ### 扩展形态
 
 - **Background（Service Worker）**：`chrome-extension/` 用 Vite **lib 模式** 打成单文件 `background.iife.js`，在 `manifest.json` 中声明为 `background.service_worker`，随扩展常驻。
-- **扩展页面**：侧边栏、选项页由各自工作区用 Vite 以 SPA 方式构建：
+- **扩展页面**：侧边栏、历史会话页由各自工作区用 Vite 以 SPA 方式构建：
   - **侧边栏**：`pages/side-panel/` → `dist/side-panel/index.html` + 静态资源；Manifest 中 `side_panel.default_path: 'side-panel/index.html'`。
-  - **选项页**：`pages/options/` → `dist/options/index.html`；Manifest 中 `options_page: 'options/index.html'`。
+  - **历史会话页**：`pages/options/` → `dist/options/index.html`；Manifest 中 `options_page: 'options/index.html'`。
 - **内容脚本**：`pages/content/` → `dist/content/index.iife.js`，在 Manifest 的 `content_scripts` 中配置注入到 `http(s)://*` 等页面。
 
 ### 构建与产物
 
 - **Monorepo + Turbo**：根目录 `pnpm build` 按依赖顺序构建 `chrome-extension`、`pages/side-panel`、`pages/options`、`pages/content`，各包产物写入 **同一 dist 目录**。
 - **Manifest 生成**：`chrome-extension` 的 Vite 插件 `makeManifestPlugin` 在构建结束时从 `manifest.js` 生成 `dist/manifest.json`，写入 side_panel、options_page、background、content_scripts 等路径。
-- **加载方式**：在 `chrome://extensions` 选择「加载已解压的扩展程序」指向 `dist/`，Chrome 按 manifest 加载 background、侧边栏、选项页和 content script，**无需单独起 HTTP 服务**。
+- **加载方式**：在 `chrome://extensions` 选择「加载已解压的扩展程序」指向 `dist/`，Chrome 按 manifest 加载 background、侧边栏、历史会话页和 content script，**无需单独起 HTTP 服务**。
 
 ### 前端架构流程图
 
@@ -81,7 +81,7 @@ flowchart TB
   subgraph 运行["Chrome 按 manifest 加载"]
     MF --> R1[Service Worker]
     MF --> R2[侧边栏]
-    MF --> R3[选项页]
+    MF --> R3[历史会话页]
     MF --> R4[Content Script]
   end
 
@@ -117,7 +117,7 @@ flowchart TB
 ### 2. chrome.storage（配置与历史）
 
 - 扩展配置、聊天历史、收藏等通过 `@extension/storage` 封装 **chrome.storage** 读写。
-- 侧边栏、选项页、Background 在同一扩展内 **共用同一份 storage**，无需再发消息同步；选项页改配置后，Background 和侧边栏下次读取即可拿到新值。
+- 侧边栏、历史会话页、Background 在同一扩展内 **共用同一份 storage**，无需再发消息同步；历史会话页改配置后，Background 和侧边栏下次读取即可拿到新值。
 
 ### 小结
 
@@ -136,7 +136,7 @@ flowchart TB
 
 - 监听 `chrome.runtime.onConnect`，校验来自侧边栏的 `side-panel-connection`。
 - 按消息类型分发：`new_task` → 创建 Executor 并执行；`follow_up_task` / `cancel_task` / `pause_task` / `resume_task` / `state` / `screenshot` / `speech_to_text` / `replay` 等。
-- 管理当前 `Executor`、`BrowserContext`，可选本地配置（如 `aihr.config.local.json`）。
+- 管理当前 `Executor`、`BrowserContext`，可选本地配置（如 `auto.config.local.json`）。
 
 ### 执行器（Executor）
 

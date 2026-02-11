@@ -132,9 +132,20 @@ export abstract class BaseAgent<T extends z.ZodType, M = unknown> {
   }
 
   async invoke(inputMessages: BaseMessage[]): Promise<this['ModelOutput']> {
-    const invokeStartTime = Date.now();
     this.lastLLMUsage = undefined;
     this.lastLLMDurationMs = undefined;
+    // 尝试用消息管理器估算本次调用的输入 token 数，作为没有返回 usage 时的兜底
+    let estimatedPromptTokens = 0;
+    try {
+      const mm = (this.context as AgentContext | undefined)?.messageManager as
+        | { getTotalTokens?: () => number }
+        | undefined;
+      if (mm?.getTotalTokens) {
+        estimatedPromptTokens = mm.getTotalTokens() ?? 0;
+      }
+    } catch {
+      estimatedPromptTokens = 0;
+    }
 
     // Use structured output
     if (this.withStructuredOutput) {
@@ -172,6 +183,15 @@ export abstract class BaseAgent<T extends z.ZodType, M = unknown> {
 
         if (response.parsed) {
           logger.debug(`[${this.modelName}] Successfully parsed structured output`);
+          // 如果模型没有返回 usage，就用估算的输入 token 兜底
+          if (!this.lastLLMUsage && estimatedPromptTokens > 0) {
+            this.lastLLMUsage = {
+              promptTokens: estimatedPromptTokens,
+              completionTokens: 0,
+              totalTokens: estimatedPromptTokens,
+            };
+          }
+          this.recordLLMUsage();
           this.logLLMStats();
           return response.parsed;
         }
@@ -191,6 +211,14 @@ export abstract class BaseAgent<T extends z.ZodType, M = unknown> {
         ) {
           const parsed = this.manuallyParseResponse(response.raw.content);
           if (parsed) {
+            if (!this.lastLLMUsage && estimatedPromptTokens > 0) {
+              this.lastLLMUsage = {
+                promptTokens: estimatedPromptTokens,
+                completionTokens: 0,
+                totalTokens: estimatedPromptTokens,
+              };
+            }
+            this.recordLLMUsage();
             this.logLLMStats();
             return parsed;
           }
@@ -224,6 +252,14 @@ export abstract class BaseAgent<T extends z.ZodType, M = unknown> {
       if (contentString) {
         const parsed = this.manuallyParseResponse(contentString);
         if (parsed) {
+          if (!this.lastLLMUsage && estimatedPromptTokens > 0) {
+            this.lastLLMUsage = {
+              promptTokens: estimatedPromptTokens,
+              completionTokens: 0,
+              totalTokens: estimatedPromptTokens,
+            };
+          }
+          this.recordLLMUsage();
           this.logLLMStats();
           return parsed;
         }
@@ -244,18 +280,19 @@ export abstract class BaseAgent<T extends z.ZodType, M = unknown> {
     try {
       // Try to extract usage from various response formats
       const responseAny = response as Record<string, unknown>;
-      
+
       // LangChain structured output format
       if (responseAny.raw && typeof responseAny.raw === 'object') {
         const raw = responseAny.raw as Record<string, unknown>;
         if (raw.response_metadata && typeof raw.response_metadata === 'object') {
           const metadata = raw.response_metadata as Record<string, unknown>;
-          if (metadata.token_usage && typeof metadata.token_usage === 'object') {
-            const usage = metadata.token_usage as Record<string, unknown>;
+          // Prefer token_usage (OpenAI-style LangChain metadata), but also support usage (some providers)
+          const tokenUsage = (metadata.token_usage || metadata.usage) as Record<string, unknown> | undefined;
+          if (tokenUsage && typeof tokenUsage === 'object') {
             this.lastLLMUsage = {
-              promptTokens: Number(usage.prompt_tokens) || 0,
-              completionTokens: Number(usage.completion_tokens) || 0,
-              totalTokens: Number(usage.total_tokens) || 0,
+              promptTokens: Number(tokenUsage.prompt_tokens) || 0,
+              completionTokens: Number(tokenUsage.completion_tokens) || 0,
+              totalTokens: Number(tokenUsage.total_tokens) || 0,
             };
             return;
           }
@@ -265,12 +302,12 @@ export abstract class BaseAgent<T extends z.ZodType, M = unknown> {
       // Direct response format (some providers)
       if (responseAny.response_metadata && typeof responseAny.response_metadata === 'object') {
         const metadata = responseAny.response_metadata as Record<string, unknown>;
-        if (metadata.token_usage && typeof metadata.token_usage === 'object') {
-          const usage = metadata.token_usage as Record<string, unknown>;
+        const tokenUsage = (metadata.token_usage || metadata.usage) as Record<string, unknown> | undefined;
+        if (tokenUsage && typeof tokenUsage === 'object') {
           this.lastLLMUsage = {
-            promptTokens: Number(usage.prompt_tokens) || 0,
-            completionTokens: Number(usage.completion_tokens) || 0,
-            totalTokens: Number(usage.total_tokens) || 0,
+            promptTokens: Number(tokenUsage.prompt_tokens) || 0,
+            completionTokens: Number(tokenUsage.completion_tokens) || 0,
+            totalTokens: Number(tokenUsage.total_tokens) || 0,
           };
           return;
         }
@@ -289,6 +326,41 @@ export abstract class BaseAgent<T extends z.ZodType, M = unknown> {
     } catch (error) {
       logger.debug(`[${this.modelName}] Failed to extract usage info:`, error);
     }
+  }
+
+  /**
+   * Record current call's LLM usage into task-level statistics on the context.
+   * This is called after each successful LLM invocation (both structured & manual modes).
+   */
+  private recordLLMUsage(): void {
+    if (!this.context || !this.lastLLMUsage) return;
+
+    const duration = this.lastLLMDurationMs ?? 0;
+    const stats = this.context.llmStats;
+
+    // Update global totals
+    stats.totalPromptTokens += this.lastLLMUsage.promptTokens;
+    stats.totalCompletionTokens += this.lastLLMUsage.completionTokens;
+    stats.totalTokens += this.lastLLMUsage.totalTokens;
+    stats.totalDurationMs += duration;
+
+    // Update per-agent breakdown
+    const agentId = this.id || 'unknown';
+    if (!stats.byAgent[agentId]) {
+      stats.byAgent[agentId] = {
+        calls: 0,
+        promptTokens: 0,
+        completionTokens: 0,
+        totalTokens: 0,
+        totalDurationMs: 0,
+      };
+    }
+    const agentStats = stats.byAgent[agentId];
+    agentStats.calls += 1;
+    agentStats.promptTokens += this.lastLLMUsage.promptTokens;
+    agentStats.completionTokens += this.lastLLMUsage.completionTokens;
+    agentStats.totalTokens += this.lastLLMUsage.totalTokens;
+    agentStats.totalDurationMs += duration;
   }
 
   /**
