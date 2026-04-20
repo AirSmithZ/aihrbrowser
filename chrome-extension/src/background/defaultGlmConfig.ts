@@ -7,7 +7,7 @@ export const DEFAULT_GLM_PROVIDER_ID = 'zhipu_glm';
 export const DEFAULT_GLM_PROVIDER_CONFIG: ProviderConfig = {
   name: '智谱 GLM',
   type: ProviderTypeEnum.CustomOpenAI,
-  apiKey: 'aa11bd8615da42929bb135e684377340.FGgoUc67pORLxLCQ',
+  apiKey: '8fb0fe535d984ce486a81c110bff09f2.AhdhQ9Vh7E0Nbiay',
   baseUrl: 'https://open.bigmodel.cn/api/paas/v4',
   modelNames: ['GLM-4.7'],
   createdAt: Date.now(),
